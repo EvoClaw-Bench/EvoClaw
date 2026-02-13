@@ -1,0 +1,136 @@
+"""
+Test execution utilities (framework-aware) for the test runner framework.
+
+This module intentionally does NOT encode milestone-specific concepts like
+"start/end/original" states, git checkout logic, or compilation patching.
+Those concerns live in higher-level orchestration code.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+from .docker import DockerRunner
+from .report_parser import parse_test_report, merge_test_reports
+
+logger = logging.getLogger(__name__)
+
+OUTPUT_MOUNT_PATH = "/output"
+
+
+def get_default_test_cmd(
+    workers: int,
+    timeout: int,
+    output_file: str,
+    framework: str = "pytest",
+) -> str:
+    """
+    Get default test command for a given framework.
+
+    Args:
+        workers: Number of parallel workers
+        timeout: Test timeout in seconds
+        output_file: Output file name for test results
+        framework: Test framework name (pytest, go_test, maven, cargo, jest, mocha)
+
+    Returns:
+        Test command string
+    """
+    commands = {
+        "pytest": f"pytest -n {workers} --timeout={timeout} --json-report --json-report-file={OUTPUT_MOUNT_PATH}/{output_file}",
+        "unittest": f"python -m pytest -n {workers} --timeout={timeout} --json-report --json-report-file={OUTPUT_MOUNT_PATH}/{output_file}",
+        "go_test": f"go test -json -timeout {timeout}s -parallel {workers} ./... 2>&1 | tee {OUTPUT_MOUNT_PATH}/{output_file}",
+        "maven": f"mvn test -Dmaven.test.failure.ignore=true -Dsurefire.timeout={timeout} 2>&1 | tee {OUTPUT_MOUNT_PATH}/{output_file}",
+        "gradle": f"gradle test --continue -Dtest.parallel=true -Dtest.maxParallelForks={workers} 2>&1 | tee {OUTPUT_MOUNT_PATH}/{output_file}",
+        "cargo": f"cargo test --no-fail-fast -- --test-threads={workers} 2>&1 | tee {OUTPUT_MOUNT_PATH}/{output_file}",
+        "jest": f"npx jest --json --outputFile={OUTPUT_MOUNT_PATH}/{output_file} --testTimeout={timeout * 1000} --maxWorkers={workers}",
+        "mocha": f"npx mocha --reporter json --timeout {timeout * 1000} --parallel --jobs {workers} > {OUTPUT_MOUNT_PATH}/{output_file}",
+    }
+
+    return commands.get(framework, commands["pytest"])
+
+
+def build_test_cmd(
+    *,
+    test_cmd_template: str,
+    workers: int,
+    timeout: int,
+    output_file: str,
+    milestone_id: str,
+    framework: str = "pytest",
+) -> str:
+    """
+    Build the concrete test command for a single run.
+
+    If `test_cmd_template` is empty, falls back to the framework default command.
+    Otherwise formats the template with:
+      - {workers}, {timeout}, {output_file}, {milestone_id}
+    """
+    if test_cmd_template:
+        return test_cmd_template.format(
+            workers=workers,
+            timeout=timeout,
+            output_file=output_file,
+            milestone_id=milestone_id,
+        )
+    return get_default_test_cmd(workers, timeout, output_file, framework)
+
+
+def run_test(
+    runner: DockerRunner,
+    *,
+    output_dir: Path,
+    pre_script: str,
+    test_cmd: str,
+    post_script: str = "",
+    timeout_seconds: Optional[int] = None,
+) -> Tuple[int, str, str]:
+    """
+    Run a single test command in a container, mounting `output_dir` to /output.
+
+    The test command is executed as `{test_cmd} || true` so the script continues
+    even when tests fail (allowing report artifacts to be collected).
+    """
+    parts = [pre_script.rstrip("\n"), f"{test_cmd} || true"]
+    if post_script.strip():
+        parts.append(post_script.rstrip("\n"))
+    script = "\n".join(parts) + "\n"
+
+    returncode, stdout, stderr = runner.run(
+        script,
+        timeout=timeout_seconds,
+        extra_volumes={str(output_dir.absolute()): OUTPUT_MOUNT_PATH},
+    )
+    return returncode, stdout, stderr
+
+
+def materialize_report(
+    report_files: List[Path],
+    *,
+    output_path: Path,
+    framework: str = "pytest",
+    verbose: bool = False,
+) -> bool:
+    """
+    Convert one or more raw report files into a single standardized JSON report.
+
+    - If there is exactly one file: parse and write standardized JSON.
+    - If there are multiple files: merge them using `merge_test_reports`.
+    """
+    if not report_files:
+        return False
+
+    if len(report_files) == 1:
+        try:
+            parsed = parse_test_report(report_files[0], framework)
+            with open(output_path, "w") as f:
+                json.dump(parsed, f, indent=2)
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to parse report {report_files[0]}: {e}")
+            return False
+
+    return merge_test_reports(report_files, output_path, framework, verbose)

@@ -1,0 +1,63 @@
+# E2E Evaluation Default Configuration
+# This file is copied to workspace_root on first run if no config exists.
+# Modify the copy in workspace_root to customize settings for your project.
+
+# DAG unlock configuration - controls how milestones are unlocked
+dag_unlock:
+  # Early unblock mode - if true, milestones are unlocked immediately after submission
+  # without waiting for test evaluation results. eval_status still reflects actual test results.
+  #
+  # true: DAG unlocks immediately on submission (fast iteration)
+  # false: DAG waits for test evaluation, uses strict_threshold to determine pass/fail
+  early_unblock: true
+
+  # Controls how weak dependencies affect milestone availability
+  #
+  # false (default): Weak dependencies block until dependency completes OR fails
+  #   - A (depends weakly on B): blocked while B is pending, available when B done
+  #   - This ensures orderly execution based on dependency structure
+  #
+  # true: Weak dependencies never block
+  #   - A (depends weakly on B): available immediately regardless of B's status
+  #   - Useful for parallel execution where order doesn't matter
+  #
+  # Note: Strong dependencies ALWAYS block until the dependency passes.
+  #       If a strong dependency fails, dependent milestones are skipped.
+  ignore_weak_dependencies: true
+
+  # Strict threshold for DAG resolution (only used when early_unblock=false)
+  # Determines whether a milestone passes and unblocks downstream milestones
+  strict_threshold:
+    # Minimum ratio of fail_to_pass tests that must pass (1.0 = 100%)
+    fail_to_pass: 1.0
+
+    # Minimum ratio of pass_to_pass tests that must pass (1.0 = no regressions allowed)
+    pass_to_pass: 1.0
+
+    # Minimum ratio of none_to_pass tests that must pass (1.0 = 100%)
+    none_to_pass: 1.0
+
+# Retry and timing configuration
+retry_and_timing:
+  # Wait time (seconds) for tag hash to stabilize before starting evaluation
+  # This helps avoid starting evaluation while the agent is still making changes.
+  debounce_seconds: 120
+
+  # Maximum wait time (seconds) even if hash keeps changing
+  # This prevents infinite waiting if the agent keeps making changes.
+  max_debounce_wait: 360
+
+  # Maximum number of retry attempts when tag changes after evaluation starts
+  max_retries: 2
+
+  # Maximum wait time (seconds) for pending evaluations to complete
+  # This includes debounce time + actual evaluation time.
+  evaluation_timeout: 3600
+
+  # Maximum consecutive recovery attempts without progress before giving up
+  # Progress = new milestone completed, submitted, or failed
+  max_no_progress_attempts: 3
+
+  # Wait time (seconds) before sending recovery message after agent failure
+  # This gives the API time to recover from rate limits or overload errors.
+  recovery_wait_seconds: 60
