@@ -44,17 +44,37 @@ pip install -e .
 
 ## Data Setup
 
-Each repository requires a **workspace directory** containing:
+Workspace data (metadata, SRS documents, test classifications) is hosted on HuggingFace:
+
+```bash
+# Install Git LFS if not already installed
+git lfs install
+
+# Clone the dataset
+git clone https://huggingface.co/datasets/hyd2apse/DevEvol-data
+
+# The dataset contains one directory per repository:
+# DevEvol-data/
+# ├── navidrome_navidrome_v0.57.0_v0.58.0/
+# ├── apache_dubbo_dubbo-3.3.3_dubbo-3.3.6/
+# ├── BurntSushi_ripgrep_14.1.1_15.0.0/
+# ├── zeromicro_go-zero_v1.6.0_v1.9.3/
+# ├── nushell_nushell_0.106.0_0.108.0/
+# ├── element-hq_element-web_v1.11.95_v1.11.97/
+# └── scikit-learn_scikit-learn_1.5.2_1.6.0/
+```
+
+Each repository workspace directory contains:
 
 ```
-workspace/
-├── metadata.json                  # Repo metadata (src_dirs, test_dirs, patterns)
-├── dependencies.csv               # Milestone dependency DAG
-├── milestones.csv                 # Milestone catalog
-├── selected_milestone_ids.txt     # (optional) Subset of milestones to evaluate
-├── e2e_config.yaml                # (optional) Evaluation config overrides
-├── srs/v1/{milestone_id}/SRS.md   # Requirements specification per milestone
-└── test_data/{milestone_id}/      # Baseline test classifications
+<repo_name>/
+├── metadata.json                      # Repo metadata (src_dirs, test_dirs, patterns)
+├── dependencies.csv                   # Milestone dependency DAG
+├── milestones.csv                     # Milestone catalog
+├── selected_milestone_ids.txt         # (optional) Subset of milestones to evaluate
+├── additional_dependencies.csv        # (optional) Extra DAG edges
+├── srs/{milestone_id}/SRS.md          # Requirements specification per milestone
+└── test_results/{milestone_id}/       # Baseline test classifications
     └── {milestone_id}_classification.json
 ```
 
@@ -129,7 +149,7 @@ A helper script is provided to automate this for all repositories:
 python -m harness.e2e.run_e2e \
     --repo-name navidrome_navidrome_v0.57.0_v0.58.0 \
     --image navidrome_navidrome_v0.57.0_v0.58.0/base:latest \
-    --srs-root /path/to/workspace/srs/v1 \
+    --srs-root /path/to/workspace/srs \
     --workspace-root /path/to/workspace \
     --agent claude-code \
     --model claude-sonnet-4-5-20250929 \
@@ -165,7 +185,7 @@ python -m harness.e2e.run_milestone \
     --repo-name navidrome_navidrome_v0.57.0_v0.58.0 \
     --workspace-root /path/to/workspace \
     --milestone-id milestone_001 \
-    --srs-path /path/to/workspace/srs/v1/milestone_001/SRS.md \
+    --srs-path /path/to/workspace/srs/milestone_001/SRS.md \
     --agent claude-code \
     --model claude-sonnet-4-5-20250929
 ```
@@ -177,7 +197,7 @@ python -m harness.e2e.evaluator \
     --workspace-root /path/to/workspace \
     --milestone-id M001 \
     --patch-file /path/to/trial/evaluation/M001/source_snapshot.tar \
-    --baseline-classification /path/to/workspace/test_data/M001/M001_classification.json \
+    --baseline-classification /path/to/workspace/test_results/M001/M001_classification.json \
     --output /path/to/output/evaluation_result.json
 ```
 
