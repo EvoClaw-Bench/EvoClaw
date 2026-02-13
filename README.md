@@ -85,49 +85,42 @@ Pre-built Docker images are hosted on DockerHub under the `hyd2apse` organizatio
 - **Base image** — the agent runs inside this container (passed via `--image`)
 - **Milestone images** — used by the evaluator to run tests for each milestone
 
-The evaluator automatically derives milestone image names from the workspace path:
-
-```
-{workspace_root.parent.name}/{workspace_root.name}/{milestone_id}:latest
-```
-
-Since DockerHub does not support multi-level repository names, images are published with a flat naming scheme and must be **retagged locally** after pulling.
+The evaluator expects milestone images named as `{repo_name}/{milestone_id}:latest`. Since DockerHub does not support multi-level repository names, images are published with a flat naming scheme and must be **retagged locally** after pulling.
 
 **Image naming mapping:**
 
 | DockerHub name | Local name (after retag) |
 |---|---|
-| `hyd2apse/<repo>:base` | `<repo_full>/<workspace>/base:latest` |
-| `hyd2apse/<repo>:<milestone_id>` | `<repo_full>/<workspace>/<milestone_id>:latest` |
+| `hyd2apse/<repo>:base` | `<repo_full>/base:latest` |
+| `hyd2apse/<repo>:<milestone_id>` | `<repo_full>/<milestone_id>:latest` |
 
 **Available repositories:**
 
-| Short name | Full repo name | Workspace |
-|------------|---------------|-----------|
-| `navidrome` | `navidrome_navidrome_v0.57.0_v0.58.0` | `baseline_004_v4` |
-| `dubbo` | `apache_dubbo_dubbo-3.3.3_dubbo-3.3.6` | `baseline_rerun_stage4_002_fix2_v2` |
-| `ripgrep` | `burntsushi_ripgrep_14.1.1_15.0.0` | `v1_001_v2` |
-| `go-zero` | `zeromicro_go-zero_v1.6.0_v1.9.3` | `baseline_001_rerun_stage4_008_fix` |
-| `nushell` | `nushell_nushell_0.106.0_0.108.0` | `baseline_rerun_stage4_003_fixed_v2` |
-| `element-web` | `element-hq_element-web_v1.11.95_v1.11.97` | `v1_002` |
-| `scikit-learn` | `scikit-learn_scikit-learn_1.5.2_1.6.0` | `baseline_001_rerun_stage4_002` |
+| Short name | Full repo name |
+|------------|---------------|
+| `navidrome` | `navidrome_navidrome_v0.57.0_v0.58.0` |
+| `dubbo` | `apache_dubbo_dubbo-3.3.3_dubbo-3.3.6` |
+| `ripgrep` | `burntsushi_ripgrep_14.1.1_15.0.0` |
+| `go-zero` | `zeromicro_go-zero_v1.6.0_v1.9.3` |
+| `nushell` | `nushell_nushell_0.106.0_0.108.0` |
+| `element-web` | `element-hq_element-web_v1.11.95_v1.11.97` |
+| `scikit-learn` | `scikit-learn_scikit-learn_1.5.2_1.6.0` |
 
 **Example: Pull and retag navidrome images**
 
 ```bash
 REPO=navidrome
 REPO_FULL=navidrome_navidrome_v0.57.0_v0.58.0
-WORKSPACE=baseline_004_v4
 
 # Pull and retag base image
 docker pull hyd2apse/${REPO}:base
-docker tag hyd2apse/${REPO}:base ${REPO_FULL}/${WORKSPACE}/base:latest
+docker tag hyd2apse/${REPO}:base ${REPO_FULL}/base:latest
 
 # Pull and retag all milestone images
 for MID in milestone_001 milestone_002 milestone_003_sub-01 milestone_003_sub-02 \
            milestone_003_sub-03 milestone_003_sub-04 milestone_004 milestone_006 milestone_007; do
     docker pull hyd2apse/${REPO}:${MID}
-    docker tag hyd2apse/${REPO}:${MID} ${REPO_FULL}/${WORKSPACE}/${MID}:latest
+    docker tag hyd2apse/${REPO}:${MID} ${REPO_FULL}/${MID}:latest
 done
 ```
 
