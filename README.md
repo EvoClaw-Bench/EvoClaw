@@ -2,7 +2,7 @@
 
 **End-to-End Evaluation Harness for AI Coding Agents on Real-World Software Evolution**
 
-DevEvol evaluates how well AI coding agents (Claude Code, Codex, Gemini CLI, OpenHands) can implement a sequence of real-world software milestones within a single session. Unlike single-task benchmarks, DevEvol tests agents on **multi-milestone, dependency-ordered development tasks** extracted from actual open-source repository evolution.
+EvoClaw evaluates how well AI coding agents (Claude Code, Codex, Gemini CLI, OpenHands) can implement a sequence of real-world software milestones within a single session. Unlike single-task benchmarks, EvoClaw tests agents on **multi-milestone, dependency-ordered development tasks** extracted from actual open-source repository evolution.
 
 ## Overview
 
@@ -37,8 +37,8 @@ Each evaluation trial works as follows:
 ## Installation
 
 ```bash
-git clone https://github.com/Hydrapse/DevEvol.git
-cd DevEvol
+git clone https://github.com/Hydrapse/EvoClaw.git
+cd EvoClaw
 pip install -e .
 ```
 
@@ -51,10 +51,10 @@ Workspace data (metadata, SRS documents, test classifications) is hosted on Hugg
 git lfs install
 
 # Clone the dataset
-git clone https://huggingface.co/datasets/hyd2apse/DevEvol-data
+git clone https://huggingface.co/datasets/hyd2apse/EvoClaw-data
 
 # The dataset contains one directory per repository:
-# DevEvol-data/
+# EvoClaw-data/
 # ├── navidrome_navidrome_v0.57.0_v0.58.0/
 # ├── apache_dubbo_dubbo-3.3.3_dubbo-3.3.6/
 # ├── BurntSushi_ripgrep_14.1.1_15.0.0/
