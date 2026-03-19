@@ -1,3 +1,5 @@
+> **Note:** This repository is actively being updated. Data, feature and documentation may change frequently.
+
 # EvoClaw
 
 **End-to-End Evaluation Harness for AI Coding Agents on Real-World Software Evolution**

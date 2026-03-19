@@ -128,6 +128,7 @@ class OpenHandsFramework(AgentFramework):
 try:
     import subprocess
     import os
+    import json
     import shutil
     import pwd
 
@@ -275,24 +276,26 @@ try:
     os.makedirs(openhands_dir, exist_ok=True)
 
     # Create minimal agent settings file
-    # The actual API key and base URL will be provided via environment variables
-    settings_content = '''{
-  "llm": {
-    "model": "litellm_proxy/gemini-3-flash-preview",
-    "api_key": "placeholder",
-    "base_url": "https://llm-proxy.eval.all-hands.dev",
-    "num_retries": 5,
-    "timeout": 300,
-    "temperature": 0.0,
-    "stream": false,
-    "native_tool_calling": true,
-    "reasoning_effort": "high"
-  },
-  "tools": [],
-  "mcp_config": {},
-  "include_default_tools": ["FinishTool", "ThinkTool"],
-  "kind": "Agent"
-}'''
+    # Use values from UNIFIED_BASE_URL / UNIFIED_API_KEY if available
+    llm_base_url = os.environ.get("UNIFIED_BASE_URL", "https://llm-proxy.eval.all-hands.dev")
+    llm_api_key = os.environ.get("UNIFIED_API_KEY", "placeholder")
+    settings_content = json.dumps({
+        "llm": {
+            "model": "litellm_proxy/gemini-3-flash-preview",
+            "api_key": llm_api_key,
+            "base_url": llm_base_url,
+            "num_retries": 5,
+            "timeout": 300,
+            "temperature": 0.0,
+            "stream": False,
+            "native_tool_calling": True,
+            "reasoning_effort": "high",
+        },
+        "tools": [],
+        "mcp_config": {},
+        "include_default_tools": ["FinishTool", "ThinkTool"],
+        "kind": "Agent",
+    }, indent=2)
     settings_path = os.path.join(openhands_dir, 'agent_settings.json')
     with open(settings_path, 'w') as f:
         f.write(settings_content)
