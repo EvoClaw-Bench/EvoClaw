@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, List, Type
+from typing import Dict, List, Optional, Type
 
 
 class AgentFramework(ABC):
@@ -94,6 +94,14 @@ class AgentFramework(ABC):
             List of -e arguments for docker run (e.g., ["-e", "KEY=value"])
         """
         return []
+
+    def extract_session_id_from_container(self, container_name: str) -> Optional[str]:
+        """Extract the latest session ID directly from agent files inside the container.
+
+        Override in subclasses that store session files (e.g., Codex rollout files,
+        Gemini session files). Returns None by default (falls back to stdout parsing).
+        """
+        return None
 
 
 # Registry of available agent frameworks

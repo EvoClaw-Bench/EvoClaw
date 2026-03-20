@@ -112,6 +112,9 @@ DEFAULT_CONFIG = {
         "evaluation_timeout": 3600,
         "max_no_progress_attempts": 3,
         "recovery_wait_seconds": 60,
+        "recover_message_timeout_seconds": 18000,
+        "resume_no_progress_retry_limit": 1,
+        "resume_no_progress_policy": "exit",
     },
 }
 
@@ -218,3 +221,27 @@ class E2EConfig:
     def recovery_wait_seconds(self) -> int:
         """Wait time before sending recovery message after agent failure."""
         return self.config.get("retry_and_timing", {}).get("recovery_wait_seconds", 60)
+
+    @property
+    def recover_message_timeout_seconds(self) -> int:
+        """Timeout for a single recover/resume message execution.
+
+        This is intentionally shorter than the full agent timeout to prevent a
+        single recover call from blocking the orchestrator for hours.
+        """
+        return self.config.get("retry_and_timing", {}).get("recover_message_timeout_seconds", 18000)
+
+    @property
+    def resume_no_progress_retry_limit(self) -> int:
+        """Consecutive no-progress resume exits allowed before policy is applied."""
+        return self.config.get("retry_and_timing", {}).get("resume_no_progress_retry_limit", 1)
+
+    @property
+    def resume_no_progress_policy(self) -> str:
+        """Behavior when no-progress resume retry limit is reached.
+
+        Supported values:
+        - "exit": stop resume-trial immediately (default)
+        - "start_new_session": invalidate persisted session and continue with a new one
+        """
+        return self.config.get("retry_and_timing", {}).get("resume_no_progress_policy", "exit")

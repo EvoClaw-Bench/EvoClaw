@@ -2,7 +2,8 @@
 
 import logging
 import os
-from typing import List, Optional
+import subprocess
+from typing import Dict, List, Optional
 
 from harness.e2e.agents.base import AgentFramework, register_framework
 
@@ -50,6 +51,7 @@ class OpenHandsFramework(AgentFramework):
         enable_delegation: bool = False,
         enable_condenser: bool = True,
         reasoning_effort: Optional[str] = None,
+        include_directories: Optional[list[str]] = None,
     ):
         """Initialize OpenHands framework.
 
@@ -65,6 +67,23 @@ class OpenHandsFramework(AgentFramework):
         self._api_key = api_key or os.environ.get("UNIFIED_API_KEY")
         self._base_url = base_url or os.environ.get("UNIFIED_BASE_URL")
         self._model = model or self.DEFAULT_MODEL
+
+        import logging
+
+        _logger = logging.getLogger(__name__)
+        if not self._api_key:
+            _logger.warning(
+                "⚠️  OpenHands API key not set. "
+                "Export UNIFIED_API_KEY or pass --api-key. "
+                "The agent will fail to call the LLM."
+            )
+        if not self._base_url:
+            _logger.warning(
+                "⚠️  OpenHands base URL not set. "
+                "Export UNIFIED_BASE_URL or pass --base-url. "
+                "The agent will use the container's default LLM_BASE_URL, "
+                "which may lack passthrough routing for models like gpt-5.3-codex."
+            )
         self._use_sdk = use_sdk
         self._enable_delegation = enable_delegation
         self._enable_condenser = enable_condenser
@@ -92,21 +111,44 @@ class OpenHandsFramework(AgentFramework):
         # API mode doesn't need file mounts - key is passed via env var
         return []
 
+    def _get_effective_base_url(self) -> Optional[str]:
+        """Return the effective base URL, using passthrough for supported models."""
+        if self._base_url and self._model in self._PASSTHROUGH_MODELS:
+            return self._base_url.rstrip("/") + "/openai_passthrough/v1"
+        return self._base_url
+
     def get_container_env_vars(self) -> List[str]:
         """Return Docker environment variable arguments.
 
         Maps unified env vars to OpenHands-specific env vars:
         - UNIFIED_API_KEY -> LLM_API_KEY
-        - UNIFIED_BASE_URL -> LLM_BASE_URL
+        - UNIFIED_BASE_URL -> LLM_BASE_URL (uses passthrough endpoint for supported models)
 
         Returns:
             List of -e arguments for docker run
         """
+        import logging
+
+        _logger = logging.getLogger(__name__)
+
         env_vars = []
         if self._api_key:
             env_vars.extend(["-e", f"LLM_API_KEY={self._api_key}"])
-        if self._base_url:
-            env_vars.extend(["-e", f"LLM_BASE_URL={self._base_url}"])
+        else:
+            _logger.error(
+                "❌ UNIFIED_API_KEY is not set — LLM_API_KEY will NOT be injected into the container. "
+                "The agent will fail. Set UNIFIED_API_KEY in your environment."
+            )
+        base_url = self._get_effective_base_url()
+        if base_url:
+            _logger.info("OpenHands LLM_BASE_URL: %s", base_url)
+            env_vars.extend(["-e", f"LLM_BASE_URL={base_url}"])
+        else:
+            _logger.error(
+                "❌ UNIFIED_BASE_URL is not set — LLM_BASE_URL will NOT be injected into the container. "
+                "Passthrough models (e.g. gpt-5.3-codex) will fail with 'no healthy deployments'. "
+                "Set UNIFIED_BASE_URL in your environment."
+            )
         return env_vars
 
     def get_container_init_script(self, agent_name: str) -> str:
@@ -376,7 +418,24 @@ except Exception as e:
             resume_logic = f"""    # Resume existing conversation
     from uuid import UUID
     conversation_id = UUID("{session_id}")
-    print(f"Resuming conversation: {{conversation_id}}")"""
+    print(f"Resuming conversation: {{conversation_id}}")
+    # Heal poisoned events before Conversation constructor loads them
+    _heal_poisoned_events(PERSISTENCE_DIR, conversation_id)
+    # Reset STUCK execution_status so the conversation loop actually processes
+    # new messages.  OpenHands persists "stuck" to base_state.json and has no
+    # code path to clear it on resume, making the session permanently dead.
+    for _subdir in [str(conversation_id), conversation_id.hex]:
+        _bs_path = PERSISTENCE_DIR / _subdir / "base_state.json"
+        if _bs_path.exists():
+            try:
+                _bs = json.loads(_bs_path.read_text())
+                _old_status = _bs.get("execution_status", "")
+                if _old_status in ("stuck", "error"):
+                    _bs["execution_status"] = "finished"
+                    _bs_path.write_text(json.dumps(_bs))
+                    print(f"[UNSTUCK] Reset execution_status '{{_old_status}}' -> 'finished' in {{_bs_path.name}}")
+            except Exception as _e:
+                print(f"[UNSTUCK] Warning: could not patch base_state.json: {{_e}}")"""
         else:
             resume_logic = """    # New conversation
     conversation_id = None"""
@@ -395,20 +454,34 @@ except Exception as e:
         if enable_condenser:
             condenser_setup = """
     # Setup LLMSummarizingCondenser for context compression
-    # Config tuned for ~200K context models (gemini, claude)
-    # - max_size=100: trigger at ~100 events (~150K tokens estimated)
+    # - max_size=100: trigger when events exceed 100
+    # - max_tokens: trigger when total tokens exceed threshold (model-dependent)
     # - keep_first=4: preserve initial context (task description, etc.)
     condenser = None
     try:
         from openhands.sdk.context.condenser import LLMSummarizingCondenser
+        import re
 
-        # Reuse the same LLM for condensation
+        # Determine max_tokens based on model context window
+        # Strip provider prefixes to get the leaf model name
+        _leaf_model = MODEL.split("/")[-1]
+        _LARGE_CONTEXT_PATTERNS = [
+            r"^gemini-3-flash",
+            r"^gemini-3-pro",
+            r"^gemini-3\\.1-pro",
+        ]
+        if any(re.match(p, _leaf_model) for p in _LARGE_CONTEXT_PATTERNS):
+            _condenser_max_tokens = 500000
+        else:
+            _condenser_max_tokens = 160000
+
         condenser = LLMSummarizingCondenser(
             llm=llm,
-            max_size=100,   # Trigger condensation when events exceed this (~150K tokens)
-            keep_first=4,   # Keep first N events verbatim (task context)
+            max_size=100,
+            max_tokens=_condenser_max_tokens,
+            keep_first=4,
         )
-        print("Condenser enabled: LLMSummarizingCondenser (max_size=100, keep_first=4)")
+        print(f"Condenser enabled: LLMSummarizingCondenser (max_size=100, max_tokens={_condenser_max_tokens}, keep_first=4)")
     except ImportError as e:
         print(f"Condenser not available: {e}")
     except Exception as e:
@@ -447,6 +520,250 @@ except ImportError as e:
     print("Make sure openhands-ai is installed with SDK support")
     sys.exit(1)
 
+# ---------------------------------------------------------------------------
+# Monkey-patch: repair malformed JSON in tool call arguments
+# ---------------------------------------------------------------------------
+# Some models (e.g. kimi-k2.5, minimax-m2.5) emit literal control characters
+# (raw newlines, tabs) in tool_call.arguments instead of proper JSON escape
+# sequences.  json.loads() rejects them ("Invalid control character",
+# "Unterminated string"), which poisons the conversation permanently.
+#
+# Fix: intercept _get_action_event, and when the raw arguments fail to parse,
+# escape all control chars (U+0000-U+001F) and retry.  If the repaired string
+# parses, substitute it in-place so the rest of the SDK proceeds normally.
+# ---------------------------------------------------------------------------
+import re as _re
+
+_CTRL_CHAR_RE = _re.compile(r'[\\x00-\\x1f]')
+_CTRL_CHAR_MAP = {{
+    0x09: '\\\\t',   # TAB
+    0x0a: '\\\\n',   # LF
+    0x0d: '\\\\r',   # CR
+}}
+
+def _escape_ctrl(m):
+    code = ord(m.group(0))
+    return _CTRL_CHAR_MAP.get(code, f'\\\\u{{code:04x}}')
+
+_orig_get_action_event = Agent._get_action_event
+
+def _patched_get_action_event(self, tool_call, *args, **kwargs):
+    raw = getattr(tool_call, 'arguments', None)
+    if raw:
+        try:
+            json.loads(raw)
+        except json.JSONDecodeError:
+            repaired = _CTRL_CHAR_RE.sub(_escape_ctrl, raw)
+            try:
+                json.loads(repaired)
+                tool_call.arguments = repaired
+                print(f"[JSON-REPAIR] Repaired malformed args for {{tool_call.name}}")
+            except json.JSONDecodeError:
+                pass  # let original error propagate
+    return _orig_get_action_event(self, tool_call, *args, **kwargs)
+
+Agent._get_action_event = _patched_get_action_event
+print("JSON repair patch enabled for tool call arguments")
+
+# ---------------------------------------------------------------------------
+# Monkey-patch: fix KeyError in tool_call_matching.py
+# ---------------------------------------------------------------------------
+# ToolCallMatchingProperty.manipulation_indices() uses set.remove() on
+# pending_tool_call_ids when processing ObservationBaseEvent.  If an
+# observation arrives whose tool_call_id was never added (orphaned tool
+# calls from condensed/truncated context), remove() raises KeyError and
+# crashes the session.  Fix: use discard() which is a no-op for missing
+# keys.
+# ---------------------------------------------------------------------------
+try:
+    from openhands.sdk.context.view.properties.tool_call_matching import (
+        ToolCallMatchingProperty,
+    )
+    from openhands.sdk.event import ActionEvent, ObservationBaseEvent
+
+    _orig_manipulation_indices = ToolCallMatchingProperty.manipulation_indices
+
+    def _patched_manipulation_indices(self, current_view_events):
+        from openhands.sdk.context.view.manipulation_indices import ManipulationIndices
+
+        manipulation_indices = ManipulationIndices.complete(current_view_events)
+        pending_tool_call_ids = set()
+
+        for index, event in enumerate(current_view_events):
+            match event:
+                case ActionEvent():
+                    pending_tool_call_ids.add(event.tool_call_id)
+                case ObservationBaseEvent():
+                    pending_tool_call_ids.discard(event.tool_call_id)
+
+            if pending_tool_call_ids:
+                manipulation_indices.remove(index + 1)
+
+        return manipulation_indices
+
+    ToolCallMatchingProperty.manipulation_indices = _patched_manipulation_indices
+    print("tool_call_matching patch enabled (discard instead of remove)")
+except ImportError:
+    print("WARNING: Could not patch tool_call_matching (import failed)")
+
+# ---------------------------------------------------------------------------
+# Monkey-patch: fix KeyError in event_store.py _path() / _get_single_item()
+# ---------------------------------------------------------------------------
+# EventLog._path(idx) crashes with KeyError when self._idx_to_id[idx] is
+# missing.  This happens when events are removed by the healer or when the
+# in-memory index drifts from disk (e.g. after condensation).
+#
+# Fix: patch _get_single_item to catch KeyError from _path(), trigger a
+# re-scan of the event directory, and retry once.  If still missing, skip
+# the event gracefully instead of crashing the entire session.
+# ---------------------------------------------------------------------------
+try:
+    from openhands.sdk.conversation.event_store import EventLog
+
+    _orig_get_single_item = EventLog._get_single_item
+
+    def _patched_get_single_item(self, idx):
+        import operator as _op
+        i = _op.index(idx)
+        if i < 0:
+            i += self._length
+        if i < 0 or i >= self._length:
+            raise IndexError("Event index out of range")
+        try:
+            txt = self._fs.read(self._path(i))
+            if not txt:
+                raise FileNotFoundError(f"Missing event file at index {{i}}")
+            from openhands.sdk.event import Event as _Evt
+            return _Evt.model_validate_json(txt)
+        except KeyError:
+            # idx not in _idx_to_id -- re-scan disk and retry once
+            try:
+                self._length = self._scan_and_build_index()
+            except Exception:
+                pass
+            if i >= self._length:
+                raise IndexError(f"Event index {{i}} out of range after re-scan (length={{self._length}})")
+            try:
+                txt = self._fs.read(self._path(i))
+                if not txt:
+                    raise FileNotFoundError(f"Missing event file at index {{i}} after re-scan")
+                from openhands.sdk.event import Event as _Evt
+                return _Evt.model_validate_json(txt)
+            except (KeyError, FileNotFoundError) as exc:
+                raise IndexError(f"Event index {{i}} unrecoverable after re-scan: {{exc}}") from exc
+
+    EventLog._get_single_item = _patched_get_single_item
+    print("event_store patch enabled (re-scan on KeyError in _get_single_item)")
+except ImportError:
+    print("WARNING: Could not patch event_store (import failed)")
+
+# ---------------------------------------------------------------------------
+# Conversation healer: remove poisoned AgentErrorEvent entries on resume
+# ---------------------------------------------------------------------------
+# When an AgentErrorEvent was persisted (malformed JSON in tool_call.arguments),
+# the conversation is "poisoned" -- on resume the LLM sees the error in its
+# context and the agent exits immediately (0ms, 0 turns).
+#
+# This healer scans the events directory before the Conversation constructor
+# loads events, finds AgentErrorEvent entries caused by JSON validation
+# failures, and removes them together with their paired ActionEvent.
+# ---------------------------------------------------------------------------
+
+def _heal_poisoned_events(persistence_dir, conv_id):
+    """Remove poisoned AgentErrorEvent + paired ActionEvent from event log."""
+    for subdir in [str(conv_id), conv_id.hex]:
+        events_dir = persistence_dir / subdir / "events"
+        if events_dir.exists():
+            break
+    else:
+        return 0
+
+    event_files = sorted(events_dir.glob("event-*.json"))
+    if not event_files:
+        return 0
+
+    # Pass 1: find AgentErrorEvent files with JSON validation errors
+    poison_tcids = set()
+    error_event_files = set()
+
+    for ef in event_files:
+        try:
+            data = json.loads(ef.read_text())
+        except Exception:
+            continue
+        if (data.get("kind") == "AgentErrorEvent"
+                and "Error validating args" in data.get("error", "")):
+            tcid = data.get("tool_call_id")
+            if tcid:
+                poison_tcids.add(tcid)
+            error_event_files.add(ef)
+
+    if not poison_tcids:
+        print("[HEAL] No poisoned events found - conversation is clean")
+        return 0
+
+    # Pass 2: find paired ActionEvent files (same tool_call_id)
+    action_event_files = set()
+    for ef in event_files:
+        if ef in error_event_files:
+            continue
+        try:
+            data = json.loads(ef.read_text())
+        except Exception:
+            continue
+        if data.get("kind") != "ActionEvent":
+            continue
+        # Check top-level tool_call_id (error-handler ActionEvents)
+        if data.get("tool_call_id") in poison_tcids:
+            action_event_files.add(ef)
+            continue
+        # Also check nested tool_calls list
+        for tc in data.get("tool_calls", []):
+            if tc.get("id") in poison_tcids:
+                action_event_files.add(ef)
+                break
+
+    # Overwrite poisoned files with harmless no-op events (instead of deleting,
+    # which creates index gaps that crash EventLog._scan_and_build_index).
+    import uuid as _uuid
+    all_to_heal = error_event_files | action_event_files
+    for ef in sorted(all_to_heal):
+        try:
+            old_data = json.loads(ef.read_text())
+        except Exception:
+            old_data = {{}}
+        # Build a minimal ObservationEvent that keeps the same id, tool_call_id,
+        # action_id so the event file is structurally valid but harmless to the LLM context.
+        # Must use a valid SDK observation kind (TerminalObservation) and include tool_name.
+        _heal_id = old_data.get("id", str(_uuid.uuid4()))
+        noop = {{
+            "id": _heal_id,
+            "timestamp": old_data.get("timestamp", ""),
+            "source": "environment",
+            "tool_call_id": old_data.get("tool_call_id", str(_uuid.uuid4())),
+            "tool_name": old_data.get("tool_name", "terminal"),
+            "action_id": old_data.get("action_id", _heal_id),
+            "observation": {{
+                "content": [{{
+                    "type": "text",
+                    "text": "[healed: poisoned event removed]",
+                    "cache_prompt": False,
+                }}],
+                "is_error": False,
+                "command": "echo healed",
+                "exit_code": 0,
+                "timeout": False,
+                "metadata": {{"exit_code": 0}},
+                "kind": "TerminalObservation",
+            }},
+            "kind": "ObservationEvent",
+        }}
+        ef.write_text(json.dumps(noop))
+        print(f"  [HEAL] Overwrote: {{ef.name}}")
+
+    print(f"[HEAL] Overwrote {{len(all_to_heal)}} poisoned events ({{len(error_event_files)}} errors + {{len(action_event_files)}} actions)")
+    return len(all_to_heal)
+
 # Configuration
 MODEL = "{model}"
 PROMPT_PATH = "{prompt_path}"
@@ -480,6 +797,11 @@ def _agent_sent_message(events):
         if hasattr(event, 'action_type'):
             # MessageAction means agent is waiting for user input
             return event.action_type == 'MessageAction'
+        # Some models (e.g. kimi-k2.5) emit bare MessageEvent (thinking out loud)
+        # which has 'kind' but no 'action_type'.  Treat it as a message too,
+        # otherwise the runner exits prematurely thinking the conversation ended.
+        if getattr(event, 'kind', None) == 'MessageEvent':
+            return True
     return False
 
 
@@ -586,6 +908,7 @@ def main():
         "api_key": SecretStr(API_KEY) if API_KEY else None,
         "temperature": 0.0,
         "timeout": timeout,
+        "max_output_tokens": 32768,  # Explicit cap; LiteLLM defaults can be too large
     }}
     if BASE_URL:
         llm_kwargs["base_url"] = BASE_URL
@@ -688,6 +1011,62 @@ if __name__ == "__main__":
 '''
         return script
 
+    # -- Model alias mapping for LiteLLM proxy --------------------------------
+    _MODEL_ALIAS_MAP: Dict[str, str] = {
+        "kimi-k2.5": "openrouter/moonshotai/kimi-k2.5",
+    }
+
+    # Models that need litellm's /openai_passthrough endpoint.
+    # These bypass litellm's model routing and forward directly to OpenAI,
+    # avoiding SSE stream reconstruction issues and missing model group errors.
+    _PASSTHROUGH_MODELS = {"gpt-5.3-codex"}
+
+    def _normalize_model(self, model: str) -> str:
+        """Normalize model name for LiteLLM proxy compatibility.
+
+        Rules applied in order:
+        1. Apply explicit alias mapping (e.g. kimi-k2.5 -> openrouter/moonshotai/kimi-k2.5).
+        2. Passthrough models: use 'openai/' prefix (direct OpenAI routing via passthrough).
+        3. Gemini 3.x models: append '-preview' if missing.
+        4. Add 'litellm_proxy/' prefix if not already present.
+        """
+        normalized = (model or "").strip()
+        if not normalized:
+            return normalized
+
+        # Rule 1: explicit alias
+        parts = normalized.split("/")
+        leaf = parts[-1]
+        if normalized in self._MODEL_ALIAS_MAP:
+            normalized = self._MODEL_ALIAS_MAP[normalized]
+        elif leaf in self._MODEL_ALIAS_MAP:
+            parts[-1] = self._MODEL_ALIAS_MAP[leaf]
+            normalized = "/".join(parts)
+
+        # Rule 2: passthrough models use openai/ prefix, skip litellm_proxy/
+        parts = normalized.split("/")
+        leaf = parts[-1]
+        if leaf in self._PASSTHROUGH_MODELS:
+            normalized = f"openai/{leaf}"
+            logger.info(f"Normalized OpenHands model (passthrough): {model} -> {normalized}")
+            return normalized
+
+        # Rule 3: gemini-3* needs -preview suffix
+        parts = normalized.split("/")
+        leaf = parts[-1]
+        if leaf.startswith("gemini-3") and "-preview" not in leaf:
+            parts[-1] = f"{leaf}-preview"
+            normalized = "/".join(parts)
+
+        # Rule 4: litellm_proxy/ prefix
+        if not normalized.startswith("litellm_proxy/"):
+            normalized = f"litellm_proxy/{normalized}"
+
+        if normalized != f"litellm_proxy/{model}":
+            logger.info(f"Normalized OpenHands model: {model} -> {normalized}")
+
+        return normalized
+
     def build_run_command(
         self,
         model: str,
@@ -706,11 +1085,7 @@ if __name__ == "__main__":
         Returns:
             Shell command string
         """
-        actual_model = model if model else self._model
-
-        # Add litellm_proxy/ prefix if not already present
-        if not actual_model.startswith("litellm_proxy/"):
-            actual_model = f"litellm_proxy/{actual_model}"
+        actual_model = self._normalize_model(model if model else self._model)
 
         if self._use_sdk:
             # For new runs, don't pass session_id - it's just a tracking ID from harness
@@ -801,7 +1176,7 @@ PYTHONPATH="$SITE_PACKAGES" $PYTHON_BIN {script_path}"""
         Returns:
             Shell command string
         """
-        actual_model = model if model else self._model
+        actual_model = self._normalize_model(model if model else self._model)
 
         if self._use_sdk:
             return self._build_sdk_run_command(actual_model, message_path, session_id=session_id)
@@ -834,6 +1209,78 @@ LLM_MODEL={model} openhands \\
   -f {message_path}"""
         return cmd
 
+    def extract_session_id_from_container(self, container_name: str) -> Optional[str]:
+        """Extract the latest conversation_id from OpenHands conversation dirs in the container.
+
+        OpenHands stores conversations at:
+          ~/.openhands/conversations/<conversation_id>/
+
+        Directory names are UUIDs (with or without hyphens), so we sort by
+        modification time to find the most recent conversation.
+
+        Args:
+            container_name: Name of the Docker container
+
+        Returns:
+            conversation_id from the latest conversation directory, or None
+        """
+        conversations_dir = "/home/fakeroot/.openhands/conversations"
+        try:
+            # List conversation dirs sorted by modification time (newest first)
+            result = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    container_name,
+                    "find",
+                    conversations_dir,
+                    "-mindepth",
+                    "1",
+                    "-maxdepth",
+                    "1",
+                    "-type",
+                    "d",
+                    "-printf",
+                    "%T@ %f\\n",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                return None
+
+            # Parse "timestamp dirname" lines and pick the latest
+            entries = []
+            for line in result.stdout.strip().split("\n"):
+                parts = line.split(" ", 1)
+                if len(parts) == 2:
+                    try:
+                        entries.append((float(parts[0]), parts[1]))
+                    except ValueError:
+                        continue
+
+            if not entries:
+                return None
+
+            # Sort by timestamp descending, take the latest
+            entries.sort(key=lambda x: x[0], reverse=True)
+            conversation_id = entries[0][1]
+
+            # Normalize: add hyphens if missing
+            if "-" not in conversation_id and len(conversation_id) == 32:
+                conversation_id = (
+                    f"{conversation_id[:8]}-{conversation_id[8:12]}-"
+                    f"{conversation_id[12:16]}-{conversation_id[16:20]}-"
+                    f"{conversation_id[20:]}"
+                )
+
+            return conversation_id
+        except (subprocess.TimeoutExpired, Exception) as e:
+            logger.warning(f"Failed to extract session from OpenHands container: {e}")
+
+        return None
+
     @staticmethod
     def extract_session_id(stdout_content: str) -> Optional[str]:
         """Extract session_id (conversation_id) from OpenHands output.
@@ -845,6 +1292,9 @@ LLM_MODEL={model} openhands \\
         Conversation ID: 539c3d7307ba4e3490aa12c9a2ef5cb9
         Hint: run openhands --resume 539c3d73-07ba-4e34-90aa-12c9a2ef5cb9 ...
         ```
+
+        Returns the LAST conversation_id found, since stdout is append-only
+        across resumes and earlier entries may be stale.
 
         Args:
             stdout_content: Content of agent_stdout.txt
@@ -861,21 +1311,22 @@ LLM_MODEL={model} openhands \\
         # Clean ANSI escape codes
         cleaned = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", content)
 
-        # Look for "Conversation ID: xxx" pattern (this is the authoritative source)
-        # Works for both CLI and SDK modes
-        match = re.search(r"Conversation ID:\s*([a-f0-9-]+)", cleaned)
-        if match:
-            conversation_id = match.group(1)
-            # Normalize: add hyphens if missing (OpenHands uses both formats)
-            if "-" not in conversation_id and len(conversation_id) == 32:
-                # Format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-                conversation_id = f"{conversation_id[:8]}-{conversation_id[8:12]}-{conversation_id[12:16]}-{conversation_id[16:20]}-{conversation_id[20:]}"
-            return conversation_id
+        def _normalize_conversation_id(cid: str) -> str:
+            """Add hyphens to bare 32-char hex IDs."""
+            if "-" not in cid and len(cid) == 32:
+                return f"{cid[:8]}-{cid[8:12]}-{cid[12:16]}-{cid[16:20]}-{cid[20:]}"
+            return cid
 
-        # Fallback: look for "openhands --resume <id>" hint
-        match = re.search(r"openhands --resume\s+([a-f0-9-]+)", cleaned)
-        if match:
-            return match.group(1)
+        # Look for "Conversation ID: xxx" pattern (this is the authoritative source)
+        # Works for both CLI and SDK modes — return the LAST match
+        matches = re.findall(r"Conversation ID:\s*([a-f0-9-]+)", cleaned)
+        if matches:
+            return _normalize_conversation_id(matches[-1])
+
+        # Fallback: look for "openhands --resume <id>" hint — return the LAST match
+        matches = re.findall(r"openhands --resume\s+([a-f0-9-]+)", cleaned)
+        if matches:
+            return matches[-1]
 
         return None
 

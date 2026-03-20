@@ -159,7 +159,7 @@ class MilestoneRunner:
         main_branch: str = "main",
         prompt_version: str = "milestone_v1",
         test_masking: bool = True,
-        reasoning_effort: str = "xhigh",
+        reasoning_effort: Optional[str] = None,
         trial_name: Optional[str] = None,
         max_retries: int = 5,
     ):
@@ -327,6 +327,9 @@ class MilestoneRunner:
 
             self.container_setup.truncate_git_history(self.main_branch)
 
+            # Apply whitelist-based network lockdown (blocks code hosting, removes sudo)
+            self.container_setup.lock_network()
+
             # Fallback: if no base commit from tag, use HEAD after truncation
             if not self._base_commit:
                 base_commit_result = subprocess.run(
@@ -431,8 +434,40 @@ class MilestoneRunner:
 
                 # Wait before retry (unless it's the last attempt)
                 if attempt < max_retries:
-                    logger.info(f"Waiting {retry_delay}s before retry...")
-                    time.sleep(retry_delay)
+                    wait_seconds = retry_delay
+                    if self.agent_runner._last_model_unavailable:
+                        hint = self.agent_runner._last_model_hint or (
+                            f"Repeated 500 errors observed for model '{self.model}'. "
+                            "This may be transient; if persistent, try a different model alias."
+                        )
+                        logger.error(
+                            "❗ Repeated 500 errors observed; possible model/backend compatibility issue (inferred). %s",
+                            hint,
+                        )
+                        last_error = hint
+                        break
+                    if self.agent_runner._last_invalid_session:
+                        logger.warning(
+                            "⚠️ Invalid session identifier detected during retry flow; next attempt will start fresh session."
+                        )
+                    if self.agent_runner._last_auth_error:
+                        logger.warning("🔑 Auth error detected - attempting credential refresh from host...")
+                        if self.agent_runner.refresh_container_credentials():
+                            logger.info("🔑 Credentials refreshed successfully - retrying immediately")
+                            wait_seconds = 0
+                        else:
+                            logger.error("🔑 Credential refresh failed")
+                    elif self.agent_runner._last_rate_limit:
+                        reset_secs = self.agent_runner._rate_limit_reset_seconds or 3600
+                        reset_mins = reset_secs / 60
+                        logger.warning(f"⏳ Rate limit detected - cooldown {reset_mins:.0f}m")
+                        if self.agent_runner.refresh_container_credentials():
+                            logger.info("🔑 Credentials refreshed (rate limit wait still required)")
+                        wait_seconds = reset_secs
+
+                    if wait_seconds > 0:
+                        logger.info(f"Waiting {wait_seconds}s before retry...")
+                        time.sleep(wait_seconds)
 
             if not success:
                 logger.warning(f"Agent execution failed after {max_retries} attempts. Last error: {last_error}")
@@ -1331,10 +1366,13 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
             stdout_file = self.log_dir / "agent_stdout.txt"
             stdout_stats = parser.parse_stdout_stats(stdout_file, logs_dir)
 
-            # 5. Get milestone times from git tags
+            # 5. Parse framework-native finest-grained usage units (message/turn)
+            native_usage_units = parser.parse_native_usage_units(logs_dir, stdout_file)
+
+            # 6. Get milestone times from git tags
             milestone_times = parser.get_milestone_times(self.container_name)
 
-            # 6. Compute complete trial statistics
+            # 7. Compute complete trial statistics
             trial_name = self.output_dir.name
             session_history_path = self.log_dir / "session_history.jsonl"
             stats = parser.compute_trial_stats(
@@ -1345,6 +1383,8 @@ echo "parent=$(git rev-parse --short HEAD~1 2>/dev/null || echo 'none')"
                 milestone_times=milestone_times,
                 reasoning_effort=self.reasoning_effort,
                 session_history_path=session_history_path,
+                native_usage_units=native_usage_units,
+                trial_dir=self.output_dir,
             )
 
             logger.info(
@@ -1477,9 +1517,9 @@ Output Structure:
     )
     parser.add_argument(
         "--reasoning-effort",
-        default="xhigh",
-        choices=["low", "medium", "high", "xhigh"],
-        help="Reasoning effort level for GPT-5 models (default: xhigh)",
+        default=None,
+        choices=["low", "medium", "high", "xhigh", "max"],
+        help="Reasoning effort level (default: per-agent, codex=xhigh, claude-code=high)",
     )
     parser.add_argument(
         "--trial-name",

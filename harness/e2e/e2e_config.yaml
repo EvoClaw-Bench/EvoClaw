@@ -61,3 +61,17 @@ retry_and_timing:
   # Wait time (seconds) before sending recovery message after agent failure
   # This gives the API time to recover from rate limits or overload errors.
   recovery_wait_seconds: 60
+
+  # Timeout (seconds) for one recover/resume message execution.
+  # Keep this below the full agent timeout to avoid recover-path "hangs".
+  recover_message_timeout_seconds: 18000
+
+  # Persisted no-progress resume policy (stored in trial_root/resume_retry_state.json).
+  #
+  # When --resume-trial exits due to no progress repeatedly, this counter is persisted.
+  # On the next --resume-trial, if consecutive_no_progress_exits reaches
+  # resume_no_progress_retry_limit, apply resume_no_progress_policy:
+  # - exit: stop immediately (default)
+  # - start_new_session: clear persisted session and continue with a fresh session
+  resume_no_progress_retry_limit: 3
+  resume_no_progress_policy: exit

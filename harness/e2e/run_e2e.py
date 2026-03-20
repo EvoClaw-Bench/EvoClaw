@@ -20,8 +20,10 @@ Features:
 """
 
 import argparse
+import fcntl
 import json
 import logging
+import os
 import queue
 import re
 import signal
@@ -188,7 +190,7 @@ class E2ETrialRunner:
         prompt_version: str,
         copy_testbed: bool = True,
         remove_container: bool = False,
-        reasoning_effort: str = "xhigh",
+        reasoning_effort: Optional[str] = None,
         force: bool = False,
     ):
         self.orchestrator = orchestrator
@@ -207,6 +209,7 @@ class E2ETrialRunner:
         self.watcher_thread = None
         self.watcher_stop_event = threading.Event()
         self.agent_runner = None
+        self._trial_lock_file = None  # File handle for trial-level process lock
 
         # Event queue for watcher -> main loop communication
         # Event format: (event_type, milestone_id, dag_status, eval_status, error_msg)
@@ -233,9 +236,51 @@ class E2ETrialRunner:
         # Resume priming state (only used in --resume-trial)
         self._resume_pending_debounce: Dict[str, dict] = {}
         self._resume_pending_evaluations: Dict[str, dict] = {}
+        self._resume_retry_state_path = self.orchestrator.trial_root / "resume_retry_state.json"
+        self._last_run_summary: Dict[str, object] = {}
 
         # Setup runner logger to write to the same orchestrator.log file
         self._setup_runner_logger()
+
+    def _acquire_trial_lock(self):
+        """Acquire exclusive trial-level lock to prevent concurrent processes.
+
+        Uses fcntl.flock on a .lock file in trial_root. If another process
+        already holds the lock, logs an error and exits immediately.
+        """
+        lock_path = self.orchestrator.trial_root / ".trial.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._trial_lock_file = open(lock_path, "a+")
+        try:
+            fcntl.flock(self._trial_lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Write PID for debugging
+            self._trial_lock_file.seek(0)
+            self._trial_lock_file.truncate()
+            self._trial_lock_file.write(str(os.getpid()))
+            self._trial_lock_file.flush()
+        except OSError:
+            # Another process holds the lock
+            try:
+                self._trial_lock_file.seek(0)
+                existing_pid = self._trial_lock_file.read().strip()
+            except Exception:
+                existing_pid = "unknown"
+            logger.error(
+                f"Another process (PID {existing_pid}) is already running on this trial. " f"Lock file: {lock_path}"
+            )
+            self._trial_lock_file.close()
+            self._trial_lock_file = None
+            sys.exit(1)
+
+    def _release_trial_lock(self):
+        """Release the trial-level lock."""
+        if self._trial_lock_file is not None:
+            try:
+                fcntl.flock(self._trial_lock_file.fileno(), fcntl.LOCK_UN)
+                self._trial_lock_file.close()
+            except Exception:
+                pass
+            self._trial_lock_file = None
 
     def _setup_runner_logger(self):
         """Add file handler to e2e.runner logger to write to orchestrator.log."""
@@ -244,6 +289,131 @@ class E2ETrialRunner:
         # Use [runner] prefix to distinguish from orchestrator logs
         file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] [runner] %(message)s"))
         logger.addHandler(file_handler)
+
+    def _default_resume_retry_state(self) -> dict:
+        return {
+            "version": 1,
+            "total_resume_runs": 0,
+            "total_no_progress_exits": 0,
+            "consecutive_no_progress_exits": 0,
+            "last_updated": None,
+            "last_policy_decision": None,
+            "last_resume_run": None,
+        }
+
+    def _load_resume_retry_state(self) -> dict:
+        state = self._default_resume_retry_state()
+        path = self._resume_retry_state_path
+        if not path.exists():
+            return state
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                for key in state:
+                    if key in loaded:
+                        state[key] = loaded[key]
+        except Exception as e:
+            logger.warning(f"Failed to load resume retry state from {path}: {e}")
+
+        for key in ["total_resume_runs", "total_no_progress_exits", "consecutive_no_progress_exits"]:
+            try:
+                state[key] = max(0, int(state.get(key, 0)))
+            except Exception:
+                state[key] = 0
+        return state
+
+    def _save_resume_retry_state(self, state: dict) -> None:
+        path = self._resume_retry_state_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state = dict(state)
+        state["last_updated"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+            tmp.replace(path)
+        except Exception as e:
+            logger.warning(f"Failed to save resume retry state to {path}: {e}")
+
+    def _apply_resume_no_progress_policy(self, resume_session: bool) -> tuple[bool, bool]:
+        """Apply persisted no-progress resume policy.
+
+        Returns:
+            (allow_resume_run, effective_resume_session)
+        """
+        if not resume_session:
+            return True, False
+
+        state = self._load_resume_retry_state()
+        config = self.orchestrator.config
+        limit = int(getattr(config, "resume_no_progress_retry_limit", 1) or 0)
+        policy = str(getattr(config, "resume_no_progress_policy", "exit") or "exit").strip().lower()
+        if policy not in {"exit", "start_new_session"}:
+            logger.warning(f"Unknown resume_no_progress_policy '{policy}', fallback to 'exit'")
+            policy = "exit"
+
+        consecutive = int(state.get("consecutive_no_progress_exits", 0) or 0)
+        if limit <= 0 or consecutive < limit:
+            return True, True
+
+        decision = {
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "policy": policy,
+            "limit": limit,
+            "consecutive_no_progress_exits": consecutive,
+        }
+        state["last_policy_decision"] = decision
+        self._save_resume_retry_state(state)
+
+        if policy == "start_new_session":
+            logger.warning(
+                "Resume no-progress limit reached (%s/%s); policy=start_new_session, will clear session and continue.",
+                consecutive,
+                limit,
+            )
+            orchestrator_logger.warning(
+                "⚠️ Resume no-progress limit reached (%s/%s); starting a fresh agent session",
+                consecutive,
+                limit,
+            )
+            return True, False
+
+        logger.warning(
+            "Resume no-progress limit reached (%s/%s); policy=exit, skipping this resume-trial run.",
+            consecutive,
+            limit,
+        )
+        orchestrator_logger.warning("⚠️ Resume skipped by policy: no-progress limit reached (%s/%s)", consecutive, limit)
+        return False, True
+
+    def _record_resume_run_outcome(
+        self,
+        *,
+        resume_session_requested: bool,
+        resume_session_used: bool,
+        success: bool,
+    ) -> None:
+        """Persist resume-run outcome for next --resume-trial decision."""
+        state = self._load_resume_retry_state()
+        state["total_resume_runs"] = int(state.get("total_resume_runs", 0) or 0) + 1
+
+        summary = dict(self._last_run_summary or {})
+        stopped_by_no_progress = bool(summary.get("stopped_by_no_progress_limit", False))
+        made_any_progress = bool(summary.get("made_any_progress", False))
+
+        if stopped_by_no_progress:
+            state["total_no_progress_exits"] = int(state.get("total_no_progress_exits", 0) or 0) + 1
+            state["consecutive_no_progress_exits"] = int(state.get("consecutive_no_progress_exits", 0) or 0) + 1
+        elif made_any_progress or success:
+            state["consecutive_no_progress_exits"] = 0
+
+        state["last_resume_run"] = {
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "success": bool(success),
+            "resume_session_requested": bool(resume_session_requested),
+            "resume_session_used": bool(resume_session_used),
+            "summary": summary,
+        }
+        self._save_resume_retry_state(state)
 
     def start_watcher_thread(self):
         """Start watcher in background thread.
@@ -867,6 +1037,7 @@ class E2ETrialRunner:
         first_run = True
         recover_count = 0
         no_progress_count = 0
+        made_any_progress = False
         max_no_progress_attempts = config.max_no_progress_attempts
 
         # Track progress by monitoring DAG state changes
@@ -892,6 +1063,21 @@ class E2ETrialRunner:
         logger.info("Starting E2E Agent with Recovery Support")
         logger.info("=" * 70)
 
+        def _set_last_run_summary(stop_reason: str):
+            self._last_run_summary = {
+                "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "stop_reason": stop_reason,
+                "recover_attempts": recover_count,
+                "final_no_progress_count": no_progress_count,
+                "max_no_progress_attempts": max_no_progress_attempts,
+                "stopped_by_no_progress_limit": stop_reason == "no_progress_limit",
+                "made_any_progress": made_any_progress,
+                "dag_done": dag.is_done(),
+                "completed_count": len(dag.completed_milestones),
+                "failed_count": len(dag.failed_milestones),
+                "skipped_count": len(dag.skipped_milestones),
+            }
+
         # Create agent runner
         self.agent_runner = E2EAgentRunner(
             container_name=self.orchestrator.container_name,
@@ -908,18 +1094,57 @@ class E2ETrialRunner:
         # Capture initial state
         prev_state = get_dag_progress_state()
         has_new_tasks = True  # First run always has tasks
+        configured_recover_timeout = int(getattr(config, "recover_message_timeout_seconds", 0) or 0)
+        if configured_recover_timeout > 0:
+            recover_timeout_ms = min(self.timeout_ms, configured_recover_timeout * 1000)
+        else:
+            recover_timeout_ms = self.timeout_ms
+        logger.info(
+            "Recover message timeout configured to %.1f minutes",
+            recover_timeout_ms / 1000 / 60,
+        )
 
         while not dag.is_done() and no_progress_count < max_no_progress_attempts:
             if first_run:
                 if resume_session_first:
                     logger.info("Attempting to resume previous agent session (first run)...")
                     orchestrator_logger.info("🔁 Agent resume attempt (first run)")
-                    success = self.agent_runner.send_recover_message(has_new_tasks=True)
+                    self.orchestrator._update_task_queue_file(self.orchestrator.trial_root)
+                    success = self.agent_runner.send_recover_message(has_new_tasks=True, timeout_ms=recover_timeout_ms)
                     if not success:
                         # Check if DAG completed while agent was running - no need to fallback
                         if dag.is_done():
                             logger.info("Resume failed but DAG is complete - skipping fallback")
+                        elif self.agent_runner._last_model_unavailable:
+                            hint = self.agent_runner._last_model_hint or (
+                                f"Repeated 500 errors observed for model '{self.model}'. "
+                                "This may be transient; if persistent, try a different model alias."
+                            )
+                            logger.error(
+                                "❗ Resume failed with repeated 500 errors; possible model/backend compatibility issue "
+                                "(inferred). %s",
+                                hint,
+                            )
+                            orchestrator_logger.error(
+                                "❗ Resume failed with repeated 500 errors; possible model/backend compatibility issue "
+                                "(inferred): %s",
+                                hint,
+                            )
+                            _set_last_run_summary("model_unavailable")
+                            return False
+                        elif self.agent_runner._last_rate_limit or self.agent_runner._last_auth_error:
+                            # Rate limit or auth error during resume - don't destroy session,
+                            # let the main failure handler (line 948+) deal with sleep/retry
+                            logger.warning(
+                                "Resume failed due to rate limit / auth error - skipping fallback to preserve session"
+                            )
+                            orchestrator_logger.info("⏳ Resume hit rate limit / auth error - will sleep and retry")
                         else:
+                            if self.agent_runner._last_invalid_session:
+                                logger.warning(
+                                    "Resume session ID is invalid/expired, clearing persistent session and starting fresh."
+                                )
+                                orchestrator_logger.info("🧹 Invalid session ID detected; starting new agent session")
                             logger.warning("Resume attempt failed, falling back to a new agent session...")
                             orchestrator_logger.info("🧹 Clearing persistent session (fallback to new)")
                             try:
@@ -940,7 +1165,10 @@ class E2ETrialRunner:
                     f"Sending recover message (recover #{recover_count}, has_new_tasks={has_new_tasks}, no_progress={no_progress_count}/{max_no_progress_attempts})..."
                 )
                 orchestrator_logger.info(f"🔄 Agent recover message sent (recover #{recover_count})")
-                success = self.agent_runner.send_recover_message(has_new_tasks=has_new_tasks)
+                self.orchestrator._update_task_queue_file(self.orchestrator.trial_root)
+                success = self.agent_runner.send_recover_message(
+                    has_new_tasks=has_new_tasks, timeout_ms=recover_timeout_ms
+                )
                 orchestrator_logger.info(
                     f"Agent recover {recover_count} completed" + (" ✓" if success else " ✗ (failed)")
                 )
@@ -951,6 +1179,32 @@ class E2ETrialRunner:
                     logger.info("Agent failed but DAG is complete - no recovery needed")
                     break
                 logger.error("Agent execution failed")
+                if self.agent_runner._last_model_unavailable:
+                    hint = self.agent_runner._last_model_hint or (
+                        f"Repeated 500 errors observed for model '{self.model}'. "
+                        "This may be transient; if persistent, try a different model alias."
+                    )
+                    logger.error(
+                        "❗ Aborting trial to avoid futile retries: repeated 500 errors suggest a possible "
+                        "model/backend compatibility issue (inferred). %s",
+                        hint,
+                    )
+                    orchestrator_logger.error(
+                        "❗ Aborting trial to avoid futile retries: repeated 500 errors suggest a possible "
+                        "model/backend compatibility issue (inferred): %s",
+                        hint,
+                    )
+                    _set_last_run_summary("model_unavailable")
+                    return False
+                if self.agent_runner._last_invalid_session:
+                    logger.warning(
+                        "Detected invalid session identifier; will invalidate persistent session before next recovery."
+                    )
+                    orchestrator_logger.warning("⚠️ Invalid session identifier detected; forcing fresh session")
+                    try:
+                        self.agent_runner.invalidate_persistent_session(reason="invalid_session")
+                    except Exception as e:
+                        logger.warning(f"Failed to invalidate persistent session: {e}")
                 # Check if this was a rate limit - sleep until reset
                 if self.agent_runner._last_rate_limit:
                     reset_secs = self.agent_runner._rate_limit_reset_seconds
@@ -964,31 +1218,24 @@ class E2ETrialRunner:
                         orchestrator_logger.info("⏳ Rate limit hit - sleeping 60m (default)")
                     # Don't count rate limits as "no progress"
                     no_progress_count = max(0, no_progress_count - 1)
-                    # Try refreshing credentials first - if host has a fresh token,
-                    # skip the long sleep and retry immediately
+                    # Best-effort credential refresh, but never skip rate-limit wait.
                     if self.agent_runner.refresh_container_credentials():
-                        logger.info("🔑 Fresh credentials available on host - skipping rate limit sleep")
-                        orchestrator_logger.info("🔑 Fresh credentials from host - skipping rate limit sleep")
-                    else:
-                        self.agent_runner.refresh_container_credentials()
-                        time.sleep(reset_secs)
-                    # After refresh/sleep, force a fresh session start
-                    self.agent_runner.invalidate_persistent_session(reason="rate_limit_wait")
-                    first_run = True
+                        logger.info("🔑 Credentials refreshed from host (rate limit wait still required)")
+                        orchestrator_logger.info("🔑 Credentials refreshed from host (rate limit wait still required)")
+                    time.sleep(reset_secs)
+                    # Session is still valid after rate limit - resume it, don't invalidate
+                    # (rate limit is an external constraint, not a session problem)
                     continue
                 # Check if this was an auth error - refresh credentials before retry
                 elif self.agent_runner._last_auth_error:
                     logger.warning("🔑 Auth error detected - attempting credential refresh from host...")
                     orchestrator_logger.info("🔑 Auth error detected - refreshing credentials from host")
                     if self.agent_runner.refresh_container_credentials():
-                        logger.info("🔑 Credentials refreshed - will start new session")
+                        logger.info("🔑 Credentials refreshed - will resume existing session")
                         orchestrator_logger.info("🔑 Credentials refreshed successfully")
-                        # Invalidate the broken session so next attempt starts fresh
-                        self.agent_runner.invalidate_persistent_session(reason="auth_error_refresh")
-                        # Force next iteration to do a fresh run instead of recover
-                        first_run = True
                         # Don't count auth failures as "no progress"
                         no_progress_count = max(0, no_progress_count - 1)
+                        # Session is still valid - just retry with refreshed credentials
                     else:
                         logger.error("🔑 Credential refresh failed - host token may also be expired")
                         orchestrator_logger.error("🔑 Credential refresh failed")
@@ -1011,6 +1258,7 @@ class E2ETrialRunner:
                 logger.info(
                     f"Progress detected: completed={len(curr_state['completed'])}, submitted={len(curr_state['submitted'])}"
                 )
+                made_any_progress = True
                 no_progress_count = 0  # Reset no-progress counter
             else:
                 no_progress_count += 1
@@ -1043,6 +1291,7 @@ class E2ETrialRunner:
         self.watcher_stop_event.set()
 
         if dag.is_done():
+            _set_last_run_summary("all_done")
             logger.info("=" * 70)
             logger.info("E2E Trial COMPLETED")
             logger.info(f"  Completed: {len(dag.completed_milestones)}")
@@ -1052,6 +1301,8 @@ class E2ETrialRunner:
             logger.info("=" * 70)
             return True
         else:
+            stop_reason = "no_progress_limit" if no_progress_count >= max_no_progress_attempts else "incomplete"
+            _set_last_run_summary(stop_reason)
             remaining = dag.all_milestones - dag.completed_milestones - dag.failed_milestones - dag.skipped_milestones
             logger.warning("=" * 70)
             logger.warning("E2E Trial INCOMPLETE")
@@ -1062,6 +1313,34 @@ class E2ETrialRunner:
             logger.warning(f"  Stopped after {no_progress_count} consecutive attempts without progress")
             logger.warning("=" * 70)
             return False
+
+    def _clear_stale_log_files(self):
+        """Clear stale log files after --force recreates the container.
+
+        When --force destroys and recreates the container, the OpenHands conversation
+        persistence directory inside the container is wiped.  Host-side log files
+        (agent_stdout.txt, .agent_session_id, etc.) still reference the old session,
+        so we must clear them to prevent extract_session_id from returning stale IDs.
+        """
+        stale_files = [
+            "agent_stdout.txt",
+            "agent_stderr.txt",
+            ".agent_session_id",
+            "session_id.txt",
+            "session_history.jsonl",
+            "resume_message.txt",
+        ]
+        cleared = []
+        for name in stale_files:
+            path = self.agent_output_dir / name
+            if path.exists():
+                try:
+                    path.unlink()
+                    cleared.append(name)
+                except Exception as e:
+                    logger.warning(f"Failed to remove stale log file {name}: {e}")
+        if cleared:
+            logger.info(f"Cleared stale log files after --force: {', '.join(cleared)}")
 
     def cleanup(self):
         """Cleanup after trial: copy testbed and optionally remove container."""
@@ -1124,6 +1403,9 @@ class E2ETrialRunner:
         else:
             logger.info(f"Container {container_name} kept running (use --remove-container to remove)")
 
+        # Release trial lock
+        self._release_trial_lock()
+
         logger.info("Cleanup complete.")
 
     def _extract_agent_stats(self):
@@ -1152,10 +1434,13 @@ class E2ETrialRunner:
             stdout_file = self.agent_output_dir / "agent_stdout.txt"
             stdout_stats = parser.parse_stdout_stats(stdout_file, logs_dir)
 
-            # 5. Get milestone times from git tags
+            # 5. Parse framework-native finest-grained usage units (message/turn)
+            native_usage_units = parser.parse_native_usage_units(logs_dir, stdout_file)
+
+            # 6. Get milestone times from git tags
             milestone_times = parser.get_milestone_times(container_name)
 
-            # 6. Compute complete trial statistics
+            # 7. Compute complete trial statistics
             trial_name = trial_root.name
             model = self.agent_runner.model if hasattr(self.agent_runner, "model") else "unknown"
             session_history_path = self.agent_output_dir / "session_history.jsonl"
@@ -1167,9 +1452,11 @@ class E2ETrialRunner:
                 milestone_times=milestone_times,
                 reasoning_effort=self.reasoning_effort,
                 session_history_path=session_history_path,
+                native_usage_units=native_usage_units,
+                trial_dir=trial_root,
             )
 
-            # 7. Save to agent_stats.json
+            # 8. Save to agent_stats.json
             stats_path = trial_root / "agent_stats.json"
             stats.to_json(stats_path)
             logger.info(f"✓ Agent stats saved to {stats_path}")
@@ -1197,12 +1484,20 @@ class E2ETrialRunner:
     def run(self) -> bool:
         """Run the complete E2E trial."""
         self._install_sigterm_handler()
+        self._acquire_trial_lock()
         success = False
         try:
             # Setup environment synchronously BEFORE starting agent
             # This ensures container is ready and task queue is populated
             logger.info("Setting up E2E environment (synchronous)...")
             self.orchestrator.setup_environment(force=self.force)
+
+            # When --force recreates the container, clear stale host-side log files.
+            # These files (especially agent_stdout.txt) contain old Conversation IDs
+            # that would pollute session_id extraction for the new session.
+            if self.force:
+                self._clear_stale_log_files()
+
             self.orchestrator._update_task_queue_file(self.orchestrator.trial_root)
             logger.info("E2E environment ready, task queue populated")
 
@@ -1233,7 +1528,14 @@ class E2ETrialRunner:
         Returns:
             True if trial completed successfully
         """
+        requested_resume_session = bool(resume_session)
+        allow_run, resume_session = self._apply_resume_no_progress_policy(requested_resume_session)
+        if not allow_run:
+            logger.warning("Resume-trial stopped by persisted no-progress policy before agent startup.")
+            return False
+
         self._install_sigterm_handler()
+        self._acquire_trial_lock()
         success = False
         try:
             if not resume_session:
@@ -1268,6 +1570,11 @@ class E2ETrialRunner:
 
             # Run agent with recovery
             success = self.run_agent_with_recovery(resume_session_first=resume_session)
+            self._record_resume_run_outcome(
+                resume_session_requested=requested_resume_session,
+                resume_session_used=resume_session,
+                success=success,
+            )
             return success
 
         except KeyboardInterrupt:
@@ -1380,7 +1687,7 @@ def _run_resume_mode(args):
         prompt_version=metadata.get("prompt_version", "v2"),
         copy_testbed=not args.skip_testbed_copy,
         remove_container=args.remove_container,
-        reasoning_effort=metadata.get("reasoning_effort", "xhigh"),
+        reasoning_effort=metadata.get("reasoning_effort"),
     )
 
     # Run with resume mode
@@ -1442,9 +1749,9 @@ Example:
     )
     parser.add_argument(
         "--reasoning-effort",
-        default="xhigh",
-        choices=["low", "medium", "high", "xhigh"],
-        help="Reasoning effort level for GPT-5 models (default: xhigh)",
+        default=None,
+        choices=["low", "medium", "high", "xhigh", "max"],
+        help="Reasoning effort level (default: per-agent, codex=xhigh, claude-code=high)",
     )
 
     # Config

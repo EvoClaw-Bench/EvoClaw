@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from harness.e2e.log_parser.base import AgentLogParser, register_parser
-from harness.e2e.log_parser.models import ToolCallRecord, TrialStats
+from harness.e2e.log_parser.models import NativeUsageUnit, ToolCallRecord, TrialStats
 
 logger = logging.getLogger(__name__)
 
@@ -546,6 +546,11 @@ class OpenHandsLogParser(AgentLogParser):
         # Check if this is a subagent/micro-agent/delegate action
         is_subagent = action_kind in self.DELEGATE_ACTION_KINDS
 
+        # Extract raw command for terminal actions (used by verification classifier)
+        bash_command = None
+        if action_kind == "TerminalAction" and isinstance(action, dict):
+            bash_command = action.get("command")
+
         return ToolCallRecord(
             id=str(tool_id),
             name=tool_name,
@@ -555,6 +560,7 @@ class OpenHandsLogParser(AgentLogParser):
             output_size=0,  # Will be updated by parse_tool_results
             milestone_id=None,
             is_subagent=is_subagent,
+            _bash_command=bash_command,
         )
 
     def _parse_timestamp(self, timestamp_val: Any) -> Optional[datetime]:
@@ -689,6 +695,68 @@ class OpenHandsLogParser(AgentLogParser):
         # Fallback to stdout parsing
         return self._parse_stats_from_stdout(stdout_file)
 
+    def parse_native_usage_units(
+        self,
+        log_dir: Path,
+        stdout_file: Path,
+    ) -> List[NativeUsageUnit]:
+        """Parse native turn-level usage units from OpenHands metrics events."""
+        units: List[NativeUsageUnit] = []
+        event_files = sorted(log_dir.rglob("event-*.json"))
+        seen_ids = set()
+
+        for idx, event_file in enumerate(event_files):
+            try:
+                event = json.loads(event_file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+
+            event_kind = event.get("kind", "")
+            event_type = event.get("type", "")
+            if not (event_kind == "MetricsEvent" or event_type == "metrics" or "usage" in event):
+                continue
+
+            usage = event.get("usage", event)
+            if not isinstance(usage, dict):
+                continue
+
+            model = str(usage.get("model", "unknown"))
+            input_tokens = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
+            output_tokens = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
+            cache_read_tokens = int(usage.get("cache_read_tokens", 0) or 0)
+            if input_tokens <= 0 and output_tokens <= 0 and cache_read_tokens <= 0:
+                continue
+
+            unit_id = str(event.get("id") or event_file.name or f"event-{idx}")
+            if unit_id in seen_ids:
+                continue
+            seen_ids.add(unit_id)
+
+            timestamp = self._parse_timestamp(event.get("timestamp"))
+            explicit_cost = event.get("cost")
+            if isinstance(explicit_cost, (int, float)):
+                cost = float(explicit_cost)
+            else:
+                cost = self._calculate_cost(model, input_tokens, output_tokens)
+
+            units.append(
+                NativeUsageUnit(
+                    id=unit_id,
+                    source_type="turn",
+                    timestamp=timestamp,
+                    model=model,
+                    token_usage={
+                        "inputTokens": input_tokens,
+                        "outputTokens": output_tokens,
+                        "cacheReadInputTokens": cache_read_tokens,
+                    },
+                    cost_usd=cost,
+                )
+            )
+
+        logger.info(f"Parsed {len(units)} native usage units from OpenHands logs")
+        return units
+
     def _parse_stats_from_raw_logs(self, log_dir: Path) -> Dict:
         """Parse statistics from raw event files and base_state.json.
 
@@ -776,12 +844,12 @@ class OpenHandsLogParser(AgentLogParser):
                     total_turns += api_calls
 
                     if token_usage:
-                        model_usage[model_name]["inputTokens"] = token_usage.get("prompt_tokens", 0)
-                        model_usage[model_name]["outputTokens"] = token_usage.get("completion_tokens", 0)
-                        model_usage[model_name]["cacheReadTokens"] = token_usage.get("cache_read_tokens", 0)
-                        model_usage[model_name]["reasoningTokens"] = token_usage.get("reasoning_tokens", 0)
-                        model_usage[model_name]["costUSD"] = accumulated_cost
-                        model_usage[model_name]["apiRequests"] = api_calls
+                        model_usage[model_name]["inputTokens"] += token_usage.get("prompt_tokens", 0)
+                        model_usage[model_name]["outputTokens"] += token_usage.get("completion_tokens", 0)
+                        model_usage[model_name]["cacheReadTokens"] += token_usage.get("cache_read_tokens", 0)
+                        model_usage[model_name]["reasoningTokens"] += token_usage.get("reasoning_tokens", 0)
+                        model_usage[model_name]["costUSD"] += accumulated_cost
+                        model_usage[model_name]["apiRequests"] += api_calls
 
                 logger.info(f"Parsed base_state.json: cost=${total_cost:.4f}")
 
@@ -803,6 +871,7 @@ class OpenHandsLogParser(AgentLogParser):
             "total_turns": total_turns,
             "modelUsage": {k: dict(v) for k, v in model_usage.items()},
             "session_count": session_count,
+            "unique_session_count": session_count,
             "duration_ms": total_duration_ms,
             "tool_calls": tool_calls,
             "tool_call_breakdown": dict(tool_call_breakdown),
@@ -832,6 +901,7 @@ class OpenHandsLogParser(AgentLogParser):
                 "total_turns": 0,
                 "modelUsage": {},
                 "session_count": 0,
+                "unique_session_count": 0,
                 "duration_ms": 0,
                 "tool_calls": [],
                 "tool_call_breakdown": {},
@@ -844,6 +914,7 @@ class OpenHandsLogParser(AgentLogParser):
                 "total_turns": 0,
                 "modelUsage": {},
                 "session_count": 0,
+                "unique_session_count": 0,
                 "duration_ms": 0,
                 "tool_calls": [],
                 "tool_call_breakdown": {},
@@ -954,6 +1025,7 @@ class OpenHandsLogParser(AgentLogParser):
             "total_turns": total_turns,
             "modelUsage": model_usage_dict,
             "session_count": session_count,
+            "unique_session_count": len(seen_conversation_ids) if seen_conversation_ids else session_count,
             "duration_ms": total_duration_ms,
             "tool_calls": tool_calls,
             "tool_call_breakdown": dict(tool_call_breakdown),
@@ -968,6 +1040,8 @@ class OpenHandsLogParser(AgentLogParser):
         milestone_times: Optional[Dict[str, Dict]] = None,
         reasoning_effort: Optional[str] = None,
         session_history_path: Optional[Path] = None,
+        native_usage_units: Optional[List[NativeUsageUnit]] = None,
+        trial_dir: Optional[Path] = None,
     ) -> TrialStats:
         """Compute complete trial statistics for OpenHands.
 
@@ -1014,12 +1088,63 @@ class OpenHandsLogParser(AgentLogParser):
             model_usage = self._add_reasoning_effort_to_model_usage(model_usage, reasoning_effort)
 
         # Assign milestones to tool calls and compute milestone stats
+        native_usage_units = list(native_usage_units or [])
         if milestone_times:
             self._assign_milestones_to_tool_calls(tool_calls, milestone_times)
-        milestone_stats = self._compute_milestone_stats(milestone_times or {}, tool_calls, stdout_stats)
+            self._assign_milestones_to_usage_units(native_usage_units, milestone_times)
 
-        # Detect sessions for transparency (duration_ms already correct from API latency)
-        sessions = self.detect_sessions_from_tool_calls(tool_calls)
+        # Apply manual overrides (if present) AFTER timestamp-based assignment
+        if trial_dir:
+            overrides = self.load_milestone_overrides(trial_dir)
+            if overrides:
+                self.apply_milestone_overrides(overrides, tool_calls, native_usage_units)
+
+        # Derive usage unit milestones from their associated tool calls
+        uu_proportional_shares = {}
+        if native_usage_units and tool_calls:
+            _, uu_proportional_shares = self._realign_usage_units_to_tool_calls(native_usage_units, tool_calls)
+
+        self._normalize_native_usage_costs(
+            native_usage_units=native_usage_units,
+            total_cost=float(stdout_stats.get("total_cost_usd", 0.0) or 0.0),
+        )
+        if not native_usage_units:
+            total_token_usage = self._extract_total_token_usage(stdout_stats.get("modelUsage", {}))
+            self._distribute_usage_to_tool_calls(
+                tool_calls=tool_calls,
+                total_cost=float(stdout_stats.get("total_cost_usd", 0.0) or 0.0),
+                total_token_usage=total_token_usage,
+            )
+        milestone_stats = self._compute_milestone_stats(
+            milestone_times or {},
+            tool_calls,
+            stdout_stats,
+            native_usage_units=native_usage_units,
+            uu_proportional_shares=uu_proportional_shares,
+        )
+
+        # Detect sessions: prefer session_history.jsonl (authoritative), fall back to tool call gaps
+        sessions: List[SessionInfo] = []
+        if session_history_path:
+            sessions = self.load_session_times_from_history(session_history_path)
+        if not sessions:
+            sessions = self.detect_sessions_from_tool_calls(tool_calls)
+
+        # Derive session counts from session_history (authoritative) when
+        # available — stdout-based counts can miss sessions whose output was
+        # lost after process restart.
+        if sessions and any(s.session_id for s in sessions):
+            session_count = len(sessions)
+            unique_session_count = len(set(s.session_id for s in sessions if s.session_id))
+        else:
+            session_count = stdout_stats.get("session_count", 0)
+            unique_session_count = stdout_stats.get("unique_session_count", stdout_stats.get("session_count", 0))
+
+        # Classify behavior_detail for shell tool calls
+        self._classify_behavior_detail(tool_calls)
+
+        # Classify verification events from Bash tool calls (independent)
+        verification_events = self._build_verification_events(tool_calls)
 
         return TrialStats(
             trial_name=trial_name,
@@ -1033,11 +1158,14 @@ class OpenHandsLogParser(AgentLogParser):
             total_turns=stdout_stats.get("total_turns", 0),
             total_tool_calls=len(tool_calls),
             total_subagent_calls=total_subagent_calls,
-            session_count=stdout_stats.get("session_count", 0),
+            session_count=session_count,
+            unique_session_count=unique_session_count,
             sessions=sessions,
             reasoning_effort=effective_reasoning_effort,
             model_usage=model_usage,
             tool_call_breakdown=tool_call_breakdown,
             milestone_stats=milestone_stats,
+            native_usage_units=native_usage_units,
             all_tool_calls=tool_calls,
+            verification_events=verification_events,
         )

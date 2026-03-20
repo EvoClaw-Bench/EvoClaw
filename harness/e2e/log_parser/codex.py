@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from harness.e2e.log_parser.base import AgentLogParser, register_parser
-from harness.e2e.log_parser.models import ToolCallRecord
+from harness.e2e.log_parser.models import NativeUsageUnit, ToolCallRecord
 
 logger = logging.getLogger(__name__)
 
@@ -207,7 +207,7 @@ class CodexLogParser(AgentLogParser):
             payload = event["payload"]
             payload_type = payload.get("type", "")
 
-            if payload_type == "function_call":
+            if payload_type in ("function_call", "custom_tool_call"):
                 # Add timestamp from outer event if not in payload
                 if "timestamp" not in payload and "timestamp" in event:
                     payload["timestamp"] = event["timestamp"]
@@ -215,7 +215,7 @@ class CodexLogParser(AgentLogParser):
                 if call:
                     calls.append(call)
 
-            elif payload_type == "function_call_output":
+            elif payload_type in ("function_call_output", "custom_tool_call_output"):
                 # This is a result event - handled by parse_tool_results
                 pass
 
@@ -279,6 +279,11 @@ class CodexLogParser(AgentLogParser):
             except (ValueError, OSError):
                 pass
 
+        # Extract raw command for Bash-like tool calls (used by verification classifier)
+        bash_command = None
+        if tool_name in ("shell_command", "exec_command") and isinstance(tool_input, dict):
+            bash_command = tool_input.get("command") or tool_input.get("cmd")
+
         return ToolCallRecord(
             id=tool_id,
             name=tool_name,
@@ -288,6 +293,7 @@ class CodexLogParser(AgentLogParser):
             output_size=0,
             milestone_id=None,
             is_subagent=False,
+            _bash_command=bash_command,
         )
 
     def _create_command_record(
@@ -327,14 +333,27 @@ class CodexLogParser(AgentLogParser):
             output_size=len(event.get("output", "").encode("utf-8")),
             milestone_id=None,
             is_subagent=False,
+            _bash_command=command if command else None,
         )
 
-    # Token pricing per 1M tokens (as of 2026-01)
+    # Token pricing per 1M tokens.
+    # Verified against OpenAI's pricing page on 2026-03-06.
     # https://openai.com/api/pricing/
-    # https://llm-stats.com/models/gpt-5.2-codex
-    # Cached input tokens get 90% discount for gpt-5.2 models
-    # Reasoning/thought tokens are billed as output tokens
+    #
+    # Pricing entries can be either:
+    # - flat: {"input": ..., "cached_input": ..., "output": ...}
+    # - tiered: {"tiers": [{"threshold": ..., ...}, ...]}
+    #
+    # For GPT-5.4, prompts above 272K input tokens are billed at higher rates.
+    # Reasoning/thought tokens are billed as output tokens.
     TOKEN_PRICING = {
+        "gpt-5.4": {
+            "tiers": [
+                {"threshold": 272_000, "input": 2.00, "cached_input": 0.50, "output": 16.00},
+                {"threshold": float("inf"), "input": 4.00, "cached_input": 1.00, "output": 24.00},
+            ]
+        },
+        "gpt-5.3-codex": {"input": 1.75, "cached_input": 0.175, "output": 14.00},
         "gpt-5.2-codex": {"input": 1.75, "cached_input": 0.175, "output": 14.00},
         "gpt-5.2": {"input": 1.75, "cached_input": 0.175, "output": 14.00},
         "gpt-5.2-pro": {"input": 21.00, "cached_input": 2.10, "output": 168.00},
@@ -344,6 +363,42 @@ class CodexLogParser(AgentLogParser):
         "gpt-4": {"input": 30.00, "cached_input": 15.00, "output": 60.00},
         "gpt-3.5-turbo": {"input": 0.50, "cached_input": 0.25, "output": 1.50},
     }
+
+    @classmethod
+    def _resolve_pricing(cls, model: str, input_tokens: int) -> Dict[str, float]:
+        """Resolve flat or tiered pricing for a model.
+
+        For tiered models, the threshold is evaluated against the total input
+        tokens of the request, matching provider pricing rules that depend on
+        prompt size.
+        """
+        pricing = cls.TOKEN_PRICING.get(model)
+        if pricing is None:
+            logger.warning(
+                f"Unknown model '{model}' for cost calculation, using default pricing "
+                f"(input: $1.75/1M, cached: $0.175/1M, output: $14.00/1M)"
+            )
+            return {"input": 1.75, "cached_input": 0.175, "output": 14.00}
+
+        tiers = pricing.get("tiers")
+        if not tiers:
+            return pricing
+
+        for tier in tiers:
+            threshold = tier["threshold"]
+            if threshold == float("inf") or input_tokens <= int(threshold):
+                return {
+                    "input": float(tier["input"]),
+                    "cached_input": float(tier["cached_input"]),
+                    "output": float(tier["output"]),
+                }
+
+        last_tier = tiers[-1]
+        return {
+            "input": float(last_tier["input"]),
+            "cached_input": float(last_tier["cached_input"]),
+            "output": float(last_tier["output"]),
+        }
 
     def _calculate_cost(
         self,
@@ -377,14 +432,7 @@ class CodexLogParser(AgentLogParser):
         Returns:
             Estimated cost in USD
         """
-        if model not in self.TOKEN_PRICING:
-            logger.warning(
-                f"Unknown model '{model}' for cost calculation, using default pricing "
-                f"(input: $1.75/1M, cached: $0.175/1M, output: $14.00/1M)"
-            )
-            pricing = {"input": 1.75, "cached_input": 0.175, "output": 14.00}
-        else:
-            pricing = self.TOKEN_PRICING[model]
+        pricing = self._resolve_pricing(model, input_tokens)
 
         # Non-cached input tokens
         non_cached_input = max(0, input_tokens - cached_tokens)
@@ -398,6 +446,110 @@ class CodexLogParser(AgentLogParser):
         output_cost = (total_output / 1_000_000) * pricing["output"]
 
         return input_cost + cached_cost + output_cost
+
+    def parse_native_usage_units(
+        self,
+        log_dir: Path,
+        stdout_file: Path,
+    ) -> List[NativeUsageUnit]:
+        """Parse native turn-level usage units from Codex token_count events."""
+        units: List[NativeUsageUnit] = []
+        jsonl_files = sorted(log_dir.glob("*.jsonl"))
+        if not jsonl_files:
+            return units
+
+        for jsonl_file in jsonl_files:
+            current_model = "unknown"
+            seen_total_usage_keys = set()
+
+            try:
+                with open(jsonl_file, encoding="utf-8") as f:
+                    for line_num, line in enumerate(f, 1):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        event_type = event.get("type", "")
+                        if event_type == "turn_context":
+                            payload = event.get("payload", {})
+                            if isinstance(payload, dict):
+                                model = payload.get("model")
+                                if isinstance(model, str) and model:
+                                    current_model = model
+                            continue
+
+                        if event_type != "event_msg":
+                            continue
+                        payload = event.get("payload", {})
+                        if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                            continue
+
+                        info = payload.get("info", {})
+                        if not isinstance(info, dict):
+                            continue
+                        last_usage = info.get("last_token_usage", {})
+                        total_usage = info.get("total_token_usage", {})
+                        if not isinstance(last_usage, dict) or not isinstance(total_usage, dict):
+                            continue
+
+                        total_key = (
+                            int(total_usage.get("input_tokens", 0) or 0),
+                            int(total_usage.get("cached_input_tokens", 0) or 0),
+                            int(total_usage.get("output_tokens", 0) or 0),
+                            int(total_usage.get("reasoning_output_tokens", 0) or 0),
+                        )
+                        # Codex may emit duplicate token_count snapshots; dedupe by
+                        # cumulative totals within each rollout file.
+                        if total_key in seen_total_usage_keys:
+                            continue
+                        seen_total_usage_keys.add(total_key)
+
+                        input_tokens = int(last_usage.get("input_tokens", 0) or 0)
+                        cached_tokens = int(last_usage.get("cached_input_tokens", 0) or 0)
+                        output_tokens = int(last_usage.get("output_tokens", 0) or 0)
+                        reasoning_tokens = int(last_usage.get("reasoning_output_tokens", 0) or 0)
+                        if input_tokens <= 0 and cached_tokens <= 0 and output_tokens <= 0 and reasoning_tokens <= 0:
+                            continue
+
+                        timestamp = None
+                        ts_str = event.get("timestamp")
+                        if isinstance(ts_str, str) and ts_str:
+                            try:
+                                timestamp = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).replace(tzinfo=None)
+                            except ValueError:
+                                timestamp = None
+
+                        cost = self._calculate_cost(
+                            current_model,
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            cached_tokens=cached_tokens,
+                            reasoning_tokens=reasoning_tokens,
+                        )
+                        units.append(
+                            NativeUsageUnit(
+                                id=f"{jsonl_file.name}:{line_num}",
+                                source_type="turn",
+                                timestamp=timestamp,
+                                model=current_model,
+                                token_usage={
+                                    "inputTokens": input_tokens,
+                                    "outputTokens": output_tokens + reasoning_tokens,
+                                    "cacheReadInputTokens": cached_tokens,
+                                    "reasoningOutputTokens": reasoning_tokens,
+                                },
+                                cost_usd=cost,
+                            )
+                        )
+            except Exception as e:
+                logger.debug(f"Error parsing native usage units from {jsonl_file}: {e}")
+
+        logger.info(f"Parsed {len(units)} native usage units from Codex logs")
+        return units
 
     def parse_stdout_stats(self, stdout_file: Path, logs_dir: Optional[Path] = None) -> Dict:
         """Parse agent_stdout.txt and JSONL files for accumulated statistics.
@@ -416,6 +568,7 @@ class CodexLogParser(AgentLogParser):
         total_turns = 0
         model_usage: Dict[str, Dict[str, Any]] = defaultdict(lambda: defaultdict(int))
         session_count = 0
+        unique_session_ids: set[str] = set()
         current_model = "unknown"
         context_window = None
         reasoning_tokens = 0
@@ -435,6 +588,7 @@ class CodexLogParser(AgentLogParser):
                 "total_turns": 0,
                 "modelUsage": {},
                 "session_count": 0,
+                "unique_session_count": 0,
             }
 
         # Determine log directory: prefer logs_dir if provided, otherwise use stdout_file.parent/codex
@@ -497,6 +651,13 @@ class CodexLogParser(AgentLogParser):
                 # Count sessions from thread.started
                 if event_type == "thread.started":
                     session_count += 1
+                    thread_id = data.get("thread_id")
+                    if not thread_id and isinstance(data.get("thread"), dict):
+                        thread_id = data["thread"].get("id")
+                    if not thread_id:
+                        thread_id = data.get("session_id")
+                    if isinstance(thread_id, str) and thread_id:
+                        unique_session_ids.add(thread_id)
 
                 # Extract usage from turn.completed events
                 # Note: total_turns is counted from turn_context events in JSONL files
@@ -555,13 +716,19 @@ class CodexLogParser(AgentLogParser):
         # Convert defaultdicts to regular dicts
         model_usage_dict = {model: dict(usage) for model, usage in model_usage.items()}
 
-        logger.info(f"Parsed stdout: {session_count} sessions, " f"{total_turns} turns, ${total_cost:.4f}")
+        unique_session_count = len(unique_session_ids) if unique_session_ids else session_count
+
+        logger.info(
+            f"Parsed stdout: {session_count} sessions, {unique_session_count} unique sessions, "
+            f"{total_turns} turns, ${total_cost:.4f}"
+        )
 
         return {
             "total_cost_usd": total_cost,
             "total_turns": total_turns,
             "modelUsage": model_usage_dict,
             "session_count": session_count,
+            "unique_session_count": unique_session_count,
         }
 
     def parse_tool_results(
@@ -635,14 +802,18 @@ class CodexLogParser(AgentLogParser):
             payload = event["payload"]
             payload_type = payload.get("type", "")
 
-            if payload_type == "function_call_output":
+            if payload_type in ("function_call_output", "custom_tool_call_output"):
                 call_id = payload.get("call_id", "")
                 if call_id and call_id in calls_by_id:
                     tc = calls_by_id[call_id]
                     output = payload.get("output", "")
 
                     # Check for error based on output content
-                    tc.success = "Exit code: 0" in output or not output.startswith("Error")
+                    if payload_type == "custom_tool_call_output":
+                        # custom_tool_call_output uses "status" field
+                        tc.success = payload.get("status") != "error"
+                    else:
+                        tc.success = "Exit code: 0" in output or not output.startswith("Error")
 
                     if isinstance(output, str):
                         tc.output_size = len(output.encode("utf-8"))

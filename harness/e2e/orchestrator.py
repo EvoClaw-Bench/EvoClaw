@@ -476,6 +476,9 @@ class E2EOrchestrator:
         # Truncate git history to prevent agent from seeing future commits
         self.container_setup.truncate_git_history(self.main_branch)
 
+        # Apply whitelist-based network lockdown (blocks code hosting, removes sudo)
+        self.container_setup.lock_network()
+
         # Initialize summary.json early so resume_state can be persisted even before evaluations complete
         self._update_resume_state(lambda _summary: None)
 
@@ -522,6 +525,15 @@ class E2EOrchestrator:
             logger.info(f"Container {self.container_name} started successfully")
         else:
             logger.info(f"Container {self.container_name} is already running")
+
+        # Verify network lockdown is still active (iptables persists across stop/start)
+        try:
+            self.container_setup.verify_network_lockdown()
+            logger.info("Network lockdown verified on resume")
+        except RuntimeError as e:
+            logger.warning(f"Network lockdown not active on resume: {e}")
+            logger.info("Re-applying network lockdown...")
+            self.container_setup.lock_network()
 
         # Restore DAG state
         self.dag.restore_state(
@@ -1391,6 +1403,15 @@ class E2EOrchestrator:
 
         subprocess.run(
             ["docker", "cp", str(queue_file), f"{self.container_name}:/e2e_workspace/TASK_QUEUE.md"], check=True
+        )
+        # Protect TASK_QUEUE.md from agent tampering: root-owned, read-only
+        subprocess.run(
+            ["docker", "exec", self.container_name, "chown", "root:root", "/e2e_workspace/TASK_QUEUE.md"],
+            check=True,
+        )
+        subprocess.run(
+            ["docker", "exec", self.container_name, "chmod", "444", "/e2e_workspace/TASK_QUEUE.md"],
+            check=True,
         )
 
     def _copy_srs_for_tasks(self, milestone_ids: list):

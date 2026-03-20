@@ -11,3 +11,15 @@ New tasks have been added to the task queue. Please resume your work.
 
 Continue from where you left off. The workflow and constraints remain the same.
 
+## Reminder: Submission Workflow
+
+For EACH completed task, you MUST run these commands to submit:
+
+```bash
+git add <source_dirs>
+git commit -m "Implement <MILESTONE_ID>"
+git tag agent-impl-<MILESTONE_ID>
+```
+
+**Without both `git commit` AND `git tag`, your work will NOT be recorded.** The tag is the ONLY signal that triggers evaluation.
+

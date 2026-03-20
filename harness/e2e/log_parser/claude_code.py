@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from harness.e2e.log_parser.base import AgentLogParser, register_parser
-from harness.e2e.log_parser.models import ToolCallRecord
+from harness.e2e.log_parser.models import NativeUsageUnit, ToolCallRecord
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,30 @@ class ClaudeCodeLogParser(AgentLogParser):
     # Claude Code home directory in container
     CLAUDE_HOME = "/home/fakeroot/.claude"
     PROJECTS_DIR = f"{CLAUDE_HOME}/projects"
+
+    # Anthropic-style token pricing (USD / 1M tokens).
+    # Cache write multipliers:
+    # - 5m write: 1.25x input
+    # - 1h write: 2.00x input
+    # Anthropic pricing as of 2026-03.
+    # Opus 4.5/4.6: $5/$25;  Opus 4.0/4.1 (legacy): $15/$75
+    # Sonnet 4.x:   $3/$15
+    TOKEN_PRICING = {
+        "claude-sonnet": {
+            "input": 3.0,
+            "output": 15.0,
+            "cache_read": 0.3,
+            "cache_write_5m": 3.75,
+            "cache_write_1h": 6.0,
+        },
+        "claude-opus": {
+            "input": 5.0,
+            "output": 25.0,
+            "cache_read": 0.5,
+            "cache_write_5m": 6.25,
+            "cache_write_1h": 10.0,
+        },
+    }
 
     def extract_raw_logs(
         self,
@@ -97,6 +121,168 @@ class ClaudeCodeLogParser(AgentLogParser):
 
         logger.info(f"Parsed {len(all_calls)} tool calls from {len(jsonl_files)} JSONL files")
         return all_calls
+
+    def _resolve_pricing(self, model: str) -> Dict[str, float]:
+        model_l = (model or "").lower()
+        if "opus" in model_l:
+            return self.TOKEN_PRICING["claude-opus"]
+        return self.TOKEN_PRICING["claude-sonnet"]
+
+    def _calculate_message_cost(
+        self,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read_tokens: int,
+        cache_creation_5m_tokens: int,
+        cache_creation_1h_tokens: int,
+    ) -> float:
+        pricing = self._resolve_pricing(model)
+        input_cost = (input_tokens / 1_000_000) * pricing["input"]
+        output_cost = (output_tokens / 1_000_000) * pricing["output"]
+        cache_read_cost = (cache_read_tokens / 1_000_000) * pricing["cache_read"]
+        cache_write_5m_cost = (cache_creation_5m_tokens / 1_000_000) * pricing["cache_write_5m"]
+        cache_write_1h_cost = (cache_creation_1h_tokens / 1_000_000) * pricing["cache_write_1h"]
+        return input_cost + output_cost + cache_read_cost + cache_write_5m_cost + cache_write_1h_cost
+
+    def parse_native_usage_units(
+        self,
+        log_dir: Path,
+        stdout_file: Path,
+    ) -> List[NativeUsageUnit]:
+        """Parse native message-level usage units from Claude JSONL logs."""
+        units: List[NativeUsageUnit] = []
+        by_message_key: Dict[str, Dict[str, Any]] = {}
+        jsonl_files = list(log_dir.rglob("*.jsonl"))
+
+        for jsonl_file in jsonl_files:
+            # Skip non-trace metadata history.
+            if jsonl_file.name == "session_history.jsonl":
+                continue
+
+            is_subagent = "subagents" in str(jsonl_file)
+            try:
+                with open(jsonl_file, encoding="utf-8") as f:
+                    for line_num, line in enumerate(f, 1):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if record.get("type") != "assistant":
+                            continue
+
+                        message = record.get("message", {})
+                        if not isinstance(message, dict):
+                            continue
+                        usage = message.get("usage", {})
+                        if not isinstance(usage, dict):
+                            continue
+
+                        input_tokens = int(usage.get("input_tokens", 0) or 0)
+                        output_tokens = int(usage.get("output_tokens", 0) or 0)
+                        cache_read_tokens = int(usage.get("cache_read_input_tokens", 0) or 0)
+                        cache_creation_total = int(usage.get("cache_creation_input_tokens", 0) or 0)
+                        cache_creation = usage.get("cache_creation", {})
+                        cache_creation_5m = 0
+                        cache_creation_1h = 0
+                        if isinstance(cache_creation, dict):
+                            cache_creation_5m = int(cache_creation.get("ephemeral_5m_input_tokens", 0) or 0)
+                            cache_creation_1h = int(cache_creation.get("ephemeral_1h_input_tokens", 0) or 0)
+                        if cache_creation_5m + cache_creation_1h == 0 and cache_creation_total > 0:
+                            cache_creation_5m = cache_creation_total
+
+                        if (
+                            input_tokens <= 0
+                            and output_tokens <= 0
+                            and cache_read_tokens <= 0
+                            and cache_creation_total <= 0
+                        ):
+                            continue
+
+                        model = str(message.get("model", "unknown"))
+                        request_id = str(record.get("requestId", "") or "")
+                        message_id = str(message.get("id", "") or "")
+
+                        timestamp = None
+                        ts_str = record.get("timestamp")
+                        if isinstance(ts_str, str) and ts_str:
+                            try:
+                                timestamp = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).replace(tzinfo=None)
+                            except ValueError:
+                                timestamp = None
+
+                        usage_total = input_tokens + output_tokens + cache_read_tokens + cache_creation_total
+                        cost = self._calculate_message_cost(
+                            model=model,
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            cache_read_tokens=cache_read_tokens,
+                            cache_creation_5m_tokens=cache_creation_5m,
+                            cache_creation_1h_tokens=cache_creation_1h,
+                        )
+
+                        file_key = str(jsonl_file.relative_to(log_dir))
+                        if request_id or message_id:
+                            # Streaming can emit multiple assistant snapshots for the
+                            # same message; keep the final/highest-usage snapshot only.
+                            message_key = f"{file_key}|{request_id}|{message_id}"
+                        else:
+                            # No stable message identity available.
+                            message_key = f"{file_key}|line:{line_num}"
+
+                        new_record: Dict[str, Any] = {
+                            "id": request_id or message_id or f"{jsonl_file.name}:{line_num}",
+                            "source_type": "message",
+                            "timestamp": timestamp,
+                            "model": model,
+                            "token_usage": {
+                                "inputTokens": input_tokens,
+                                "outputTokens": output_tokens,
+                                "cacheReadInputTokens": cache_read_tokens,
+                                "cacheCreationInputTokens": cache_creation_total,
+                            },
+                            "cost_usd": cost,
+                            "is_subagent": is_subagent or bool(record.get("isSidechain")),
+                            "_usage_total": usage_total,
+                        }
+
+                        existing = by_message_key.get(message_key)
+                        if existing is None:
+                            by_message_key[message_key] = new_record
+                            continue
+
+                        existing_usage_total = int(existing.get("_usage_total", 0) or 0)
+                        existing_ts = existing.get("timestamp")
+                        should_replace = usage_total > existing_usage_total
+                        if not should_replace and usage_total == existing_usage_total:
+                            if existing_ts is None and timestamp is not None:
+                                should_replace = True
+                            elif isinstance(existing_ts, datetime) and isinstance(timestamp, datetime):
+                                should_replace = timestamp > existing_ts
+                        if should_replace:
+                            by_message_key[message_key] = new_record
+            except Exception as e:
+                logger.debug(f"Error parsing native usage units from {jsonl_file}: {e}")
+
+        for record in by_message_key.values():
+            units.append(
+                NativeUsageUnit(
+                    id=record["id"],
+                    source_type=record["source_type"],
+                    timestamp=record["timestamp"],
+                    model=record["model"],
+                    token_usage=record["token_usage"],
+                    cost_usd=float(record["cost_usd"]),
+                    is_subagent=bool(record["is_subagent"]),
+                )
+            )
+
+        units.sort(key=lambda x: x.timestamp if x.timestamp else datetime.min)
+        logger.info(f"Parsed {len(units)} native usage units from Claude logs")
+        return units
 
     def _parse_jsonl(self, jsonl_path: Path, is_subagent: bool = False) -> List[ToolCallRecord]:
         """Parse a single JSONL file for tool calls.
@@ -208,6 +394,11 @@ class ClaudeCodeLogParser(AgentLogParser):
         # Default success to True (would need tool_result to determine actual success)
         success = True
 
+        # Extract raw command for Bash tool calls (used by verification classifier)
+        bash_command = None
+        if tool_name == "Bash" and isinstance(tool_input, dict):
+            bash_command = tool_input.get("command")
+
         return ToolCallRecord(
             id=tool_id,
             name=tool_name,
@@ -217,13 +408,15 @@ class ClaudeCodeLogParser(AgentLogParser):
             output_size=0,  # Would need tool_result record
             milestone_id=None,  # Assigned later
             is_subagent=is_subagent,
+            _bash_command=bash_command,
         )
 
     def parse_stdout_stats(self, stdout_file: Path, logs_dir: Optional[Path] = None) -> Dict:
         """Parse agent_stdout.txt for accumulated statistics.
 
         The agent_stdout.txt file is in JSONL format with one JSON object
-        per Claude Code session (resume creates new sessions).
+        per Claude Code execution attempt. Multiple attempts may reuse the
+        same underlying session_id.
 
         Args:
             stdout_file: Path to agent_stdout.txt
@@ -235,6 +428,7 @@ class ClaudeCodeLogParser(AgentLogParser):
         total_turns = 0
         model_usage: Dict[str, Dict[str, Any]] = defaultdict(lambda: defaultdict(int))
         session_count = 0
+        unique_session_ids: set[str] = set()
 
         if not stdout_file.exists():
             logger.warning(f"stdout file not found: {stdout_file}")
@@ -243,7 +437,10 @@ class ClaudeCodeLogParser(AgentLogParser):
                 "total_turns": 0,
                 "modelUsage": {},
                 "session_count": 0,
+                "unique_session_count": 0,
             }
+
+        non_accumulating_numeric_keys = {"contextWindow", "maxOutputTokens"}
 
         with open(stdout_file, encoding="utf-8") as f:
             for line_num, line in enumerate(f, 1):
@@ -262,6 +459,9 @@ class ClaudeCodeLogParser(AgentLogParser):
                     continue
 
                 session_count += 1
+                session_id = data.get("session_id")
+                if isinstance(session_id, str) and session_id:
+                    unique_session_ids.add(session_id)
                 total_cost += data.get("total_cost_usd", 0)
                 total_turns += data.get("num_turns", 0)
 
@@ -271,18 +471,29 @@ class ClaudeCodeLogParser(AgentLogParser):
                         continue
                     for key, val in usage.items():
                         if isinstance(val, (int, float)):
-                            model_usage[model][key] += val
+                            if key in non_accumulating_numeric_keys:
+                                # Metadata fields should remain stable per model; keep a single value.
+                                prev = model_usage[model].get(key)
+                                model_usage[model][key] = max(prev, val) if isinstance(prev, (int, float)) else val
+                            else:
+                                model_usage[model][key] += val
 
         # Convert defaultdicts to regular dicts
         model_usage_dict = {model: dict(usage) for model, usage in model_usage.items()}
 
-        logger.info(f"Parsed stdout: {session_count} sessions, " f"{total_turns} turns, ${total_cost:.2f}")
+        unique_session_count = len(unique_session_ids) if unique_session_ids else session_count
+
+        logger.info(
+            f"Parsed stdout: {session_count} executions, {unique_session_count} unique sessions, "
+            f"{total_turns} turns, ${total_cost:.2f}"
+        )
 
         return {
             "total_cost_usd": total_cost,
             "total_turns": total_turns,
             "modelUsage": model_usage_dict,
             "session_count": session_count,
+            "unique_session_count": unique_session_count,
         }
 
     def parse_tool_results(self, log_dir: Path, tool_calls: List[ToolCallRecord]) -> None:

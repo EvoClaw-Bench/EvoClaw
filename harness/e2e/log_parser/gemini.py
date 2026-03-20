@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from harness.e2e.log_parser.base import AgentLogParser, register_parser
-from harness.e2e.log_parser.models import ToolCallRecord, TrialStats
+from harness.e2e.log_parser.models import NativeUsageUnit, ToolCallRecord, TrialStats
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +44,25 @@ class GeminiLogParser(AgentLogParser):
                 # <= 200K prompt tokens per request
                 {"threshold": 200_000, "input": 2.00, "output": 12.00, "cached": 0.20},
                 # > 200K prompt tokens per request
+                {"threshold": float("inf"), "input": 4.00, "output": 18.00, "cached": 0.40},
+            ],
+        },
+        # Provider-prefixed aliases (same rates as canonical Gemini 3 Pro Preview)
+        "gemini/gemini-3-pro-preview": {
+            "tiers": [
+                {"threshold": 200_000, "input": 2.00, "output": 12.00, "cached": 0.20},
+                {"threshold": float("inf"), "input": 4.00, "output": 18.00, "cached": 0.40},
+            ],
+        },
+        "gemini-3.1-pro-preview": {
+            "tiers": [
+                {"threshold": 200_000, "input": 2.00, "output": 12.00, "cached": 0.20},
+                {"threshold": float("inf"), "input": 4.00, "output": 18.00, "cached": 0.40},
+            ],
+        },
+        "gemini/gemini-3.1-pro-preview": {
+            "tiers": [
+                {"threshold": 200_000, "input": 2.00, "output": 12.00, "cached": 0.20},
                 {"threshold": float("inf"), "input": 4.00, "output": 18.00, "cached": 0.40},
             ],
         },
@@ -390,6 +409,11 @@ class GeminiLogParser(AgentLogParser):
                     else:
                         timestamp = datetime.now()
 
+                    # Extract raw command for shell tool calls (used by verification classifier)
+                    bash_command = None
+                    if tool_name == "run_shell_command" and isinstance(args, dict):
+                        bash_command = args.get("command")
+
                     calls.append(
                         ToolCallRecord(
                             id=tool_id,
@@ -400,6 +424,7 @@ class GeminiLogParser(AgentLogParser):
                             output_size=output_size,
                             milestone_id=None,
                             is_subagent=False,
+                            _bash_command=bash_command,
                         )
                     )
 
@@ -542,6 +567,11 @@ class GeminiLogParser(AgentLogParser):
         # Parse timestamp
         timestamp = self._parse_timestamp(data.get("timestamp", data.get("created_at")))
 
+        # Extract raw command for shell tool calls (used by verification classifier)
+        bash_command = None
+        if tool_name == "run_shell_command" and isinstance(tool_input, dict):
+            bash_command = tool_input.get("command")
+
         return ToolCallRecord(
             id=tool_id,
             name=tool_name,
@@ -551,6 +581,7 @@ class GeminiLogParser(AgentLogParser):
             output_size=0,
             milestone_id=None,
             is_subagent=False,
+            _bash_command=bash_command,
         )
 
     def _create_tool_call_from_function_call(
@@ -576,6 +607,11 @@ class GeminiLogParser(AgentLogParser):
         # Parse timestamp from parent event
         timestamp = self._parse_timestamp(parent_event.get("timestamp"))
 
+        # Extract raw command for shell tool calls (used by verification classifier)
+        bash_command = None
+        if tool_name == "run_shell_command" and isinstance(tool_args, dict):
+            bash_command = tool_args.get("command")
+
         return ToolCallRecord(
             id=function_call.get("id", ""),
             name=tool_name,
@@ -585,6 +621,7 @@ class GeminiLogParser(AgentLogParser):
             output_size=0,
             milestone_id=None,
             is_subagent=False,
+            _bash_command=bash_command,
         )
 
     def _parse_timestamp(self, timestamp_val: Any) -> Optional[datetime]:
@@ -834,6 +871,7 @@ class GeminiLogParser(AgentLogParser):
         total_duration_ms = 0
         model_usage: Dict[str, Dict[str, Any]] = defaultdict(lambda: defaultdict(int))
         session_count = 0
+        unique_session_ids: set[str] = set()
         tool_calls: List[Dict[str, Any]] = []
         tool_call_breakdown: Dict[str, int] = defaultdict(int)
 
@@ -844,6 +882,7 @@ class GeminiLogParser(AgentLogParser):
                 "total_turns": 0,
                 "modelUsage": {},
                 "session_count": 0,
+                "unique_session_count": 0,
                 "duration_ms": 0,
                 "tool_calls": [],
                 "tool_call_breakdown": {},
@@ -876,6 +915,7 @@ class GeminiLogParser(AgentLogParser):
                         "total_turns": session_stats.get("total_turns", 0),
                         "modelUsage": model_usage_from_session,
                         "session_count": 1,
+                        "unique_session_count": 1,
                         "duration_ms": 0,
                         "tool_calls": [],
                         "tool_call_breakdown": {},
@@ -885,6 +925,7 @@ class GeminiLogParser(AgentLogParser):
                 "total_turns": 0,
                 "modelUsage": {},
                 "session_count": 0,
+                "unique_session_count": 0,
                 "duration_ms": 0,
                 "tool_calls": [],
                 "tool_call_breakdown": {},
@@ -904,6 +945,9 @@ class GeminiLogParser(AgentLogParser):
 
             if models_stats:
                 session_count += 1
+                session_id = data.get("session_id") or data.get("conversation_id") or data.get("id")
+                if isinstance(session_id, str) and session_id:
+                    unique_session_ids.add(session_id)
 
                 for model, usage in models_stats.items():
                     if not isinstance(usage, dict):
@@ -1016,14 +1060,18 @@ class GeminiLogParser(AgentLogParser):
                 logger.info(f"Counted {session_turns} turns from session log files")
 
         logger.info(
-            f"Parsed stdout: {session_count} sessions, {total_turns} turns, ${total_cost:.4f}, {len(tool_calls)} tool calls"
+            f"Parsed stdout: {session_count} sessions, {len(unique_session_ids) if unique_session_ids else session_count} unique sessions, "
+            f"{total_turns} turns, ${total_cost:.4f}, {len(tool_calls)} tool calls"
         )
+
+        unique_session_count = len(unique_session_ids) if unique_session_ids else session_count
 
         return {
             "total_cost_usd": total_cost,
             "total_turns": total_turns,
             "modelUsage": model_usage_dict,
             "session_count": session_count,
+            "unique_session_count": unique_session_count,
             "duration_ms": total_duration_ms,
             "tool_calls": tool_calls,
             "tool_call_breakdown": dict(tool_call_breakdown),
@@ -1157,6 +1205,119 @@ class GeminiLogParser(AgentLogParser):
             "per_model": dict(per_model),
         }
 
+    def parse_native_usage_units(
+        self,
+        log_dir: Path,
+        stdout_file: Path,
+    ) -> List[NativeUsageUnit]:
+        """Parse native message-level usage units from Gemini session logs."""
+        units: List[NativeUsageUnit] = []
+        gemini_dir = log_dir / "gemini"
+        if not gemini_dir.exists():
+            gemini_dir = log_dir
+
+        session_files = sorted(gemini_dir.rglob("session-*.json"))
+        if not session_files:
+            return units
+
+        seen_ids = set()
+        for session_file in session_files:
+            try:
+                with open(session_file, encoding="utf-8") as f:
+                    data = json.load(f)
+                messages = data.get("messages", [])
+                for idx, msg in enumerate(messages):
+                    if not isinstance(msg, dict) or msg.get("type") != "gemini":
+                        continue
+                    tokens = msg.get("tokens", {})
+                    if not isinstance(tokens, dict):
+                        continue
+
+                    msg_input = int(tokens.get("input", 0) or 0)
+                    msg_output = int(tokens.get("output", tokens.get("candidates", 0)) or 0)
+                    msg_thoughts = int(tokens.get("thoughts", 0) or 0)
+                    msg_cached = int(tokens.get("cached", 0) or 0)
+                    if msg_input <= 0 and msg_output <= 0 and msg_thoughts <= 0 and msg_cached <= 0:
+                        continue
+
+                    model = str(msg.get("model") or "gemini-3-flash-preview")
+                    msg_new_input = max(0, msg_input - msg_cached)
+                    msg_total_output = msg_output + msg_thoughts
+                    msg_cost = self._calculate_cost(
+                        model,
+                        msg_new_input,
+                        msg_total_output,
+                        msg_cached,
+                        prompt_tokens=msg_input,
+                    )
+
+                    timestamp = None
+                    ts_val = msg.get("timestamp")
+                    if isinstance(ts_val, str) and ts_val:
+                        try:
+                            timestamp = datetime.fromisoformat(ts_val.replace("Z", "+00:00")).replace(tzinfo=None)
+                        except ValueError:
+                            timestamp = None
+
+                    msg_id = str(msg.get("id") or f"{session_file.name}:{idx}")
+                    dedupe_key = (session_file.name, msg_id)
+                    if dedupe_key in seen_ids:
+                        continue
+                    seen_ids.add(dedupe_key)
+
+                    msg_token_usage = {
+                        "inputTokens": msg_input,
+                        "outputTokens": msg_total_output,
+                        "cacheReadInputTokens": msg_cached,
+                        "thoughtsTokens": msg_thoughts,
+                    }
+
+                    # Expand multi-toolCall messages (v0.29.5+) into
+                    # one NativeUsageUnit per tool call so that each
+                    # tool call counts as one turn and gets assigned to
+                    # the correct milestone via its own timestamp.
+                    tool_calls = msg.get("toolCalls", [])
+                    if len(tool_calls) > 1:
+                        n_tc = len(tool_calls)
+                        split_tokens = {k: v // n_tc for k, v in msg_token_usage.items()}
+                        split_cost = msg_cost / n_tc
+                        for tc_idx, tc in enumerate(tool_calls):
+                            tc_ts = None
+                            tc_ts_val = tc.get("timestamp") if isinstance(tc, dict) else None
+                            if isinstance(tc_ts_val, str) and tc_ts_val:
+                                try:
+                                    tc_ts = datetime.fromisoformat(tc_ts_val.replace("Z", "+00:00")).replace(
+                                        tzinfo=None
+                                    )
+                                except ValueError:
+                                    tc_ts = None
+                            units.append(
+                                NativeUsageUnit(
+                                    id=f"{session_file.name}:{msg_id}:tc{tc_idx}",
+                                    source_type="tool_call",
+                                    timestamp=tc_ts or timestamp,
+                                    model=model,
+                                    token_usage=dict(split_tokens),
+                                    cost_usd=split_cost,
+                                )
+                            )
+                    else:
+                        units.append(
+                            NativeUsageUnit(
+                                id=f"{session_file.name}:{msg_id}",
+                                source_type="message",
+                                timestamp=timestamp,
+                                model=model,
+                                token_usage=msg_token_usage,
+                                cost_usd=msg_cost,
+                            )
+                        )
+            except Exception as e:
+                logger.warning(f"Error parsing native usage units from {session_file}: {e}")
+
+        logger.info(f"Parsed {len(units)} native usage units from Gemini logs")
+        return units
+
     def parse_tool_results(
         self,
         log_dir: Path,
@@ -1280,6 +1441,8 @@ class GeminiLogParser(AgentLogParser):
         milestone_times: Optional[Dict[str, Dict]] = None,
         reasoning_effort: Optional[str] = None,
         session_history_path: Optional[Path] = None,
+        native_usage_units: Optional[List[NativeUsageUnit]] = None,
+        trial_dir: Optional[Path] = None,
     ) -> TrialStats:
         """Compute complete trial statistics for Gemini.
 
@@ -1296,35 +1459,99 @@ class GeminiLogParser(AgentLogParser):
         Returns:
             Complete TrialStats object
         """
-        # Use duration from stdout_stats (Gemini's totalLatencyMs)
-        duration_ms = stdout_stats.get("duration_ms", 0)
+        # Derive start/end time from tool call timestamps (accurate).
+        # Falls back to datetime.now() if no tool calls are available.
+        timed = [tc for tc in tool_calls if tc.timestamp]
+        if timed:
+            start_time = min(tc.timestamp for tc in timed)
+            end_time = max(tc.timestamp for tc in timed)
+        else:
+            end_time = datetime.now()
+            start_time = end_time
 
-        # Calculate start/end time based on duration
-        end_time = datetime.now()
-        start_time = end_time - timedelta(milliseconds=duration_ms) if duration_ms > 0 else end_time
+        # API latency from Gemini stats (used only as a fallback for duration).
+        api_latency_ms = stdout_stats.get("duration_ms", 0)
 
-        # Compute tool call breakdown
-        tool_call_breakdown = stdout_stats.get("tool_call_breakdown", {})
-        if not tool_call_breakdown:
-            tool_call_breakdown = {}
-            for tc in tool_calls:
-                tool_call_breakdown[tc.name] = tool_call_breakdown.get(tc.name, 0) + 1
+        # Compute tool call breakdown from actual tool call records
+        # (stdout stats.tools.byName systematically underreports)
+        tool_call_breakdown: Dict[str, int] = {}
+        for tc in tool_calls:
+            tool_call_breakdown[tc.name] = tool_call_breakdown.get(tc.name, 0) + 1
 
         # Count subagent calls
         total_subagent_calls = sum(1 for tc in tool_calls if tc.is_subagent)
 
         # Assign milestones to tool calls and compute milestone stats
+        native_usage_units = list(native_usage_units or [])
         if milestone_times:
             self._assign_milestones_to_tool_calls(tool_calls, milestone_times)
-        milestone_stats = self._compute_milestone_stats(milestone_times or {}, tool_calls, stdout_stats)
+            self._assign_milestones_to_usage_units(native_usage_units, milestone_times)
+
+        # Apply manual overrides (if present) AFTER timestamp-based assignment
+        if trial_dir:
+            overrides = self.load_milestone_overrides(trial_dir)
+            if overrides:
+                self.apply_milestone_overrides(overrides, tool_calls, native_usage_units)
+
+        # Derive usage unit milestones from their associated tool calls
+        uu_proportional_shares = {}
+        if native_usage_units and tool_calls:
+            _, uu_proportional_shares = self._realign_usage_units_to_tool_calls(native_usage_units, tool_calls)
+
+        self._normalize_native_usage_costs(
+            native_usage_units=native_usage_units,
+            total_cost=float(stdout_stats.get("total_cost_usd", 0.0) or 0.0),
+        )
+        if not native_usage_units:
+            total_token_usage = self._extract_total_token_usage(stdout_stats.get("modelUsage", {}))
+            self._distribute_usage_to_tool_calls(
+                tool_calls=tool_calls,
+                total_cost=float(stdout_stats.get("total_cost_usd", 0.0) or 0.0),
+                total_token_usage=total_token_usage,
+            )
+        milestone_stats = self._compute_milestone_stats(
+            milestone_times or {},
+            tool_calls,
+            stdout_stats,
+            native_usage_units=native_usage_units,
+            uu_proportional_shares=uu_proportional_shares,
+        )
 
         # Get model usage and add reasoning_effort for gpt-5* models
         model_usage = stdout_stats.get("modelUsage", {})
         if reasoning_effort:
             model_usage = self._add_reasoning_effort_to_model_usage(model_usage, reasoning_effort)
 
-        # Detect sessions for transparency (duration_ms already correct from API latency)
-        sessions = self.detect_sessions_from_tool_calls(tool_calls)
+        # Detect sessions: prefer session_history.jsonl (authoritative), fall back to tool call gaps
+        sessions: List[SessionInfo] = []
+        if session_history_path:
+            sessions = self.load_session_times_from_history(session_history_path)
+        if not sessions:
+            sessions = self.detect_sessions_from_tool_calls(tool_calls)
+
+        # Derive session counts from session_history (authoritative) when
+        # available — stdout-based counts can miss sessions whose output was
+        # lost after process restart.
+        if sessions and any(s.session_id for s in sessions):
+            session_count = len(sessions)
+            unique_session_count = len(set(s.session_id for s in sessions if s.session_id))
+        else:
+            session_count = stdout_stats.get("session_count", 0)
+            unique_session_count = stdout_stats.get("unique_session_count", stdout_stats.get("session_count", 0))
+
+        # Classify behavior_detail for shell tool calls
+        self._classify_behavior_detail(tool_calls)
+
+        # Classify verification events from Bash tool calls (independent)
+        verification_events = self._build_verification_events(tool_calls)
+
+        # Compute duration from sessions (sum of active session durations).
+        # Wall clock = total elapsed from start to end (including gaps).
+        wall_clock_ms = int((end_time - start_time).total_seconds() * 1000) if start_time and end_time else 0
+        if sessions:
+            session_duration_ms = sum(s.duration_ms for s in sessions)
+        else:
+            session_duration_ms = wall_clock_ms or api_latency_ms
 
         return TrialStats(
             trial_name=trial_name,
@@ -1332,17 +1559,20 @@ class GeminiLogParser(AgentLogParser):
             model=model,
             start_time=start_time,
             end_time=end_time,
-            duration_ms=duration_ms,
-            wall_clock_ms=duration_ms,  # For Gemini, API latency is the best we have
+            duration_ms=session_duration_ms,
+            wall_clock_ms=wall_clock_ms,
             total_cost_usd=stdout_stats.get("total_cost_usd", 0.0),
             total_turns=stdout_stats.get("total_turns", 0),
             total_tool_calls=len(tool_calls),
             total_subagent_calls=total_subagent_calls,
-            session_count=stdout_stats.get("session_count", 0),
+            session_count=session_count,
+            unique_session_count=unique_session_count,
             sessions=sessions,
             reasoning_effort=reasoning_effort,
             model_usage=model_usage,
             tool_call_breakdown=tool_call_breakdown,
             milestone_stats=milestone_stats,
+            native_usage_units=native_usage_units,
             all_tool_calls=tool_calls,
+            verification_events=verification_events,
         )

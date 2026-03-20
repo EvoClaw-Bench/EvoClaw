@@ -1,7 +1,9 @@
 """Google Gemini CLI agent framework implementation."""
 
+import json
 import logging
 import os
+import subprocess
 from typing import List, Optional
 
 from harness.e2e.agents.base import AgentFramework, register_framework
@@ -29,11 +31,14 @@ class GeminiFramework(AgentFramework):
 
     # Default model for Gemini
     DEFAULT_MODEL = "gemini-3-flash-preview"
+    # Some models are only healthy via provider-prefixed alias on our unified proxy.
+    _PREFER_PREFIX_MODELS: set[str] = set()
 
     def __init__(
         self,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
+        include_directories: Optional[List[str]] = None,
         **kwargs,  # Accept and ignore extra params like reasoning_effort
     ):
         """Initialize Gemini framework.
@@ -41,10 +46,13 @@ class GeminiFramework(AgentFramework):
         Args:
             api_key: API key. If not provided, uses UNIFIED_API_KEY env var.
             base_url: Base URL. If not provided, uses UNIFIED_BASE_URL env var.
+            include_directories: Extra directories for --include-directories.
+                E2E mode passes ["/e2e_workspace"]; mstone mode passes nothing.
             **kwargs: Additional arguments (ignored for compatibility).
         """
         self._api_key = api_key or os.environ.get("UNIFIED_API_KEY")
         self._base_url = base_url or os.environ.get("UNIFIED_BASE_URL")
+        self._include_directories = include_directories or []
         # Ignore unsupported kwargs like reasoning_effort
 
     def get_container_mounts(self) -> List[str]:
@@ -179,6 +187,42 @@ try:
         print(f"Gemini verification failed: {stderr}")
         raise Exception("Gemini CLI installation failed")
 
+    # Patch defaultModelConfigs.js to register gemini-3.1-pro-preview.
+    # Without this, gemini-3.1-pro-preview falls back to 'chat-base' config
+    # which lacks thinkingLevel: HIGH, causing degraded thinking quality.
+    import glob as _glob
+    config_pattern = '**/node_modules/@google/gemini-cli-core/dist/src/config/defaultModelConfigs.js'
+    for cfg_path in _glob.glob(config_pattern, root_dir='/', recursive=True):
+        cfg_path = '/' + cfg_path
+        try:
+            with open(cfg_path) as _f:
+                cfg_content = _f.read()
+            if "'gemini-3.1-pro-preview'" not in cfg_content:
+                old_marker = "'gemini-3-flash-preview': {"
+                new_block = (
+                    "'gemini-3.1-pro-preview': {\\n"
+                    "            extends: 'chat-base-3',\\n"
+                    "            modelConfig: {\\n"
+                    "                model: 'gemini-3.1-pro-preview',\\n"
+                    "            },\\n"
+                    "        },\\n"
+                    "        'gemini-3.1-pro-preview-customtools': {\\n"
+                    "            extends: 'chat-base-3',\\n"
+                    "            modelConfig: {\\n"
+                    "                model: 'gemini-3.1-pro-preview-customtools',\\n"
+                    "            },\\n"
+                    "        },\\n"
+                    "        " + old_marker
+                )
+                cfg_content = cfg_content.replace(old_marker, new_block, 1)
+                with open(cfg_path, 'w') as _f:
+                    _f.write(cfg_content)
+                print(f"Patched Gemini CLI model configs: {cfg_path}")
+            else:
+                print(f"Gemini CLI model configs already patched: {cfg_path}")
+        except Exception as patch_err:
+            print(f"Warning: Failed to patch {cfg_path}: {patch_err}")
+
 except Exception as e:
     print(f"Error setting up Gemini: {e}")
     import traceback
@@ -204,6 +248,7 @@ except Exception as e:
             Shell command string
         """
         actual_model = model if model else self.DEFAULT_MODEL
+        actual_model = self._normalize_model_alias(actual_model)
 
         # Use positional prompt (--prompt is deprecated)
         cmd_parts = [
@@ -213,10 +258,10 @@ except Exception as e:
             "--output-format",
             "json",
             "--yolo",  # Auto-approve all operations (bypass sandbox)
-            "--include-directories",
-            "/e2e_workspace",
-            f'"$(cat {prompt_path})"',  # Positional prompt at the end
         ]
+        for d in self._include_directories:
+            cmd_parts.extend(["--include-directories", d])
+        cmd_parts.append(f'"$(cat {prompt_path})"')  # Positional prompt at the end
 
         return " ".join(cmd_parts)
 
@@ -239,6 +284,7 @@ except Exception as e:
             Shell command string
         """
         actual_model = model if model else self.DEFAULT_MODEL
+        actual_model = self._normalize_model_alias(actual_model)
 
         cmd_parts = [
             "gemini",
@@ -249,12 +295,97 @@ except Exception as e:
             "--output-format",
             "json",
             "--yolo",
-            "--include-directories",
-            "/e2e_workspace",
-            f'"$(cat {message_path})"',  # Positional prompt at the end
         ]
+        for d in self._include_directories:
+            cmd_parts.extend(["--include-directories", d])
+        cmd_parts.append(f'"$(cat {message_path})"')  # Positional prompt at the end
 
         return " ".join(cmd_parts)
+
+    def _normalize_model_alias(self, model: str) -> str:
+        """Normalize model alias for proxy compatibility.
+
+        Normalization rules:
+        1. For Gemini 3 models without preview suffix, append "-preview".
+           Example: gemini-3.1-pro -> gemini-3.1-pro-preview
+        2. For known models that require provider prefix on unified proxy,
+           add "gemini/" prefix.
+        """
+        normalized = (model or "").strip()
+        if not normalized:
+            return normalized
+
+        original = normalized
+
+        # Rule 1: Ensure Gemini 3 model aliases use "-preview" suffix.
+        # Supports both plain model names and provider-prefixed forms.
+        parts = normalized.split("/")
+        leaf = parts[-1]
+        if leaf.startswith("gemini-3") and "-preview" not in leaf:
+            parts[-1] = f"{leaf}-preview"
+            normalized = "/".join(parts)
+
+        # Rule 2: Some aliases are only healthy via gemini/ prefix.
+        if "/" not in normalized and normalized in self._PREFER_PREFIX_MODELS:
+            normalized = f"gemini/{normalized}"
+
+        if normalized != original:
+            logger.info(f"Normalized Gemini model alias: {original} -> {normalized}")
+            return normalized
+
+        return normalized
+
+    def extract_session_id_from_container(self, container_name: str) -> Optional[str]:
+        """Extract the latest session_id from Gemini session files inside the container.
+
+        Gemini stores session files at:
+          ~/.gemini/tmp/<project_hash>/session-{ISO_timestamp}{id_prefix}.json
+
+        We find the latest session file (by sorted filename) and read the
+        sessionId field from its JSON content.
+
+        Args:
+            container_name: Name of the Docker container
+
+        Returns:
+            sessionId from the latest session file, or None
+        """
+        tmp_dir = "/home/fakeroot/.gemini/tmp"
+        try:
+            result = subprocess.run(
+                ["docker", "exec", container_name, "find", tmp_dir, "-name", "session-*.json", "-type", "f"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                return None
+
+            files = sorted(result.stdout.strip().split("\n"))
+            if not files:
+                return None
+
+            # Latest file is last after sorting (filenames contain timestamps)
+            latest_file = files[-1]
+
+            # Read the file content from inside the container
+            cat_result = subprocess.run(
+                ["docker", "exec", container_name, "cat", latest_file],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if cat_result.returncode != 0 or not cat_result.stdout.strip():
+                return None
+
+            data = json.loads(cat_result.stdout)
+            session_id = data.get("sessionId") or data.get("session_id")
+            if session_id:
+                return session_id
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception) as e:
+            logger.warning(f"Failed to extract session from Gemini container: {e}")
+
+        return None
 
     @staticmethod
     def extract_session_id(stdout_content: str) -> Optional[str]:
@@ -269,18 +400,27 @@ except Exception as e:
             session_id if found, None otherwise
         """
         import json
+        import re
+
+        content = (stdout_content or "").strip()
+        if not content:
+            return None
+
+        # Keep the latest seen session id because agent_stdout/agent_stderr are append-only.
+        latest_session_id = None
 
         # Try parsing as a single JSON object first (pretty-printed)
-        content = stdout_content.strip()
         try:
             event = json.loads(content)
-            session_id = event.get("session_id") or event.get("sessionId")
-            if session_id:
-                return session_id
+            if isinstance(event, dict):
+                session_id = event.get("session_id") or event.get("sessionId")
+                if session_id:
+                    latest_session_id = session_id
         except json.JSONDecodeError:
             pass
 
-        # Try parsing concatenated JSON objects using raw_decode
+        # Try parsing concatenated JSON objects using raw_decode.
+        # Keep scanning and return the most recent session id.
         decoder = json.JSONDecoder()
         idx = 0
         while idx < len(content):
@@ -292,15 +432,25 @@ except Exception as e:
 
             try:
                 obj, end_idx = decoder.raw_decode(content, idx)
-                session_id = obj.get("session_id") or obj.get("sessionId")
-                if session_id:
-                    return session_id
-                idx += end_idx
+                if isinstance(obj, dict):
+                    session_id = obj.get("session_id") or obj.get("sessionId")
+                    if session_id:
+                        latest_session_id = session_id
+                idx = end_idx
             except json.JSONDecodeError:
                 # Find next potential JSON start
                 next_brace = content.find("{", idx + 1)
                 if next_brace == -1:
                     break
                 idx = next_brace
+
+        if latest_session_id:
+            return latest_session_id
+
+        # Fallback for partially malformed output blocks.
+        # Example: lines containing `"session_id": "..."` that are not valid full JSON.
+        matches = re.findall(r'"(?:session_id|sessionId)"\s*:\s*"([^"]+)"', content)
+        if matches:
+            return matches[-1]
 
         return None

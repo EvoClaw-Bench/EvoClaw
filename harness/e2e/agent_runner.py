@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -49,6 +49,7 @@ class AgentRunner:
         agent_name: str = "claude-code",
         reasoning_effort: Optional[str] = None,
         use_sdk: bool = False,
+        include_directories: Optional[list[str]] = None,
     ):
         """Initialize agent runner.
 
@@ -61,6 +62,7 @@ class AgentRunner:
             agent_name: Agent framework name (e.g., "claude-code")
             reasoning_effort: Reasoning effort level for Codex ("low", "medium", "high")
             use_sdk: For OpenHands, use SDK mode instead of CLI mode
+            include_directories: Extra directories for agent (e.g., ["/e2e_workspace"])
         """
         self.container_name = container_name
         self.workdir = workdir
@@ -72,10 +74,14 @@ class AgentRunner:
 
         # Build framework kwargs
         framework_kwargs = {}
+        if model:
+            framework_kwargs["model"] = model
         if reasoning_effort:
             framework_kwargs["reasoning_effort"] = reasoning_effort
         if use_sdk:
             framework_kwargs["use_sdk"] = use_sdk
+        if include_directories:
+            framework_kwargs["include_directories"] = include_directories
 
         # Initialize framework via strategy pattern
         self._framework: AgentFramework = get_agent_framework(agent_name, **framework_kwargs)
@@ -84,12 +90,18 @@ class AgentRunner:
         self._last_auth_error = False  # Set by _execute_with_streaming on auth failures
         self._last_rate_limit = False  # Set by _execute_with_streaming on rate limit
         self._rate_limit_reset_seconds: Optional[int] = None  # Seconds until rate limit resets
+        # Set when repeated 500 errors suggest a possible model/backend compatibility issue (inferred).
+        self._last_model_unavailable = False
+        self._last_model_hint: Optional[str] = None  # Human-readable remediation hint
+        self._last_invalid_session = False  # Set when resume session ID is invalid
 
-    # Auth error patterns from Claude CLI / API responses
+    # Auth error patterns from agent CLI/API responses
     _AUTH_ERROR_PATTERNS = [
         "authentication_error",
         "OAuth token has expired",
         "Invalid API key",
+        "invalid_api_key",
+        "unauthorized",
         "Please run /login",
         "Failed to authenticate",
     ]
@@ -100,7 +112,29 @@ class AgentRunner:
         "rate_limit_error",
         "would exceed your account's rate limit",
         "rate limit",
+        "usage limit",
+        "limit reached",
+        "try again in",
+        "retry after",
+        "too many requests",
+        '"code":"429"',
+        '"code":429',
     ]
+
+    # Resume/session invalidation indicators (seen in Gemini CLI resume failures)
+    _INVALID_SESSION_PATTERNS = [
+        "invalid session identifier",
+        "use --list-sessions to see available sessions",
+    ]
+
+    # Known model aliases with recurring 500 patterns in some environments.
+    _GEMINI_MODEL_HINTS = {
+        "gemini-3-flash": (
+            "Possible model/backend compatibility issue inferred for 'gemini-3-flash' from repeated 500 errors. "
+            "This may also be a transient backend failure. Retry first; if it persists, "
+            "try '--model gemini-3-flash-preview' or '--model gemini-2.5-flash'."
+        ),
+    }
 
     def _detect_auth_error(self, output: str) -> bool:
         """Check if agent output contains authentication error indicators."""
@@ -110,56 +144,270 @@ class AgentRunner:
                 return True
         return False
 
+    # Agents that use OAuth and may hit external rate limits.
+    # API-based agents (e.g. openhands) handle rate limits internally via their SDK.
+    _OAUTH_AGENTS = {"claude-code", "codex", "gemini-cli"}
+
     def _detect_rate_limit(self, output: str) -> bool:
-        """Check if agent output contains rate limit / usage limit indicators."""
-        output_lower = output.lower()
+        """Check if agent output contains rate limit / usage limit indicators.
+
+        Only applies to OAuth-based agents (claude-code, codex, gemini-cli).
+        API-based agents (e.g. openhands) handle rate limits internally and
+        scanning their full stdout would cause false positives from file
+        contents the agent viewed.
+        """
+        if self.agent_name not in self._OAUTH_AGENTS:
+            return False
+        tail = output[-5000:].lower()
         for pattern in self._RATE_LIMIT_PATTERNS:
-            if pattern in output_lower:
+            if pattern in tail:
                 return True
         return False
 
-    def _parse_rate_limit_reset(self, output: str) -> Optional[int]:
+    def _detect_invalid_session_error(self, output: str) -> bool:
+        """Check if output indicates an invalid/expired local session reference."""
+        output_lower = output.lower()
+        return any(pattern in output_lower for pattern in self._INVALID_SESSION_PATTERNS)
+
+    def _build_model_hint(self) -> Optional[str]:
+        """Return actionable model hint, if known."""
+        model_key = (self.model or "").strip().lower()
+        return self._GEMINI_MODEL_HINTS.get(model_key)
+
+    def _detect_gemini_model_compatibility_issue(self, output: str) -> bool:
+        """Infer a possible Gemini model/backend compatibility issue from error patterns.
+
+        We intentionally keep this narrow:
+        - only gemini-cli
+        - only known model aliases in _GEMINI_MODEL_HINTS
+        - must include 500/Internal Server Error signature
+        """
+        if self.agent_name != "gemini-cli":
+            return False
+
+        model_key = (self.model or "").strip().lower()
+        if model_key not in self._GEMINI_MODEL_HINTS:
+            return False
+
+        output_lower = output.lower()
+        has_500 = any(token in output_lower for token in ["status: 500", '"code":500', '"code": 500'])
+        has_internal = "internal server error" in output_lower
+        return has_500 and has_internal
+
+    def _classify_failure_signals(self, output: str, context: str) -> None:
+        """Classify common failure signals and emit actionable hints."""
+        self._last_auth_error = self._detect_auth_error(output)
+        if self._last_auth_error:
+            self.logger.warning("🔑 Authentication error detected in %s output", context)
+
+        self._last_rate_limit = self._detect_rate_limit(output)
+        if self._last_rate_limit:
+            self._rate_limit_reset_seconds = self._parse_rate_limit_reset(output)
+            self.logger.warning("⏳ Rate limit detected in %s output", context)
+        else:
+            self._rate_limit_reset_seconds = None
+
+        self._last_model_unavailable = self._detect_gemini_model_compatibility_issue(output)
+        self._last_model_hint = self._build_model_hint() if self._last_model_unavailable else None
+        if self._last_model_unavailable:
+            hint = self._last_model_hint or (
+                "Repeated 500 errors observed. This may be transient; if persistent, try a different model alias."
+            )
+            self.logger.error(
+                "❗ Possible Gemini model/backend compatibility issue inferred for model '%s' from 500 errors. %s",
+                self.model,
+                hint,
+            )
+
+        self._last_invalid_session = self._detect_invalid_session_error(output)
+        if self._last_invalid_session:
+            self.logger.warning(
+                "Detected invalid session identifier in %s output. "
+                "This usually means the previous run exited before a resumable session was persisted.",
+                context,
+            )
+
+    # Maximum rate limit sleep: 2 hours.  Anything larger is almost certainly
+    # a false positive (e.g. terminal escape ``[?2004h`` parsed as "2004h").
+    _MAX_RATE_LIMIT_WAIT = 2 * 3600
+
+    def _parse_rate_limit_reset(
+        self,
+        output: str,
+        *,
+        now_utc: Optional[datetime] = None,
+        now_local: Optional[datetime] = None,
+    ) -> Optional[int]:
         """Parse reset time from rate limit message, return seconds to wait.
 
-        Handles patterns like "resets 3am (UTC)" or "resets 10pm (UTC)".
+        Handles patterns like:
+        - "resets 3am (UTC)"
+        - "resets in 5h"
+        - "try again in 45m"
+        - "retry after 3600"
+        - "try again at 10:08 AM"
         """
-        import time as _time
+        # Strip ANSI / terminal escape sequences to prevent false matches
+        # (e.g. ``[?2004h`` being parsed as "2004 hours").
+        output = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", output)
+        output = re.sub(r"\[\?[0-9]+[a-zA-Z]", "", output)
 
+        now_utc = now_utc or datetime.now(timezone.utc)
+        now_local = now_local or datetime.now().astimezone()
+
+        def _candidate_wait(reset_at: datetime, now: datetime) -> Optional[int]:
+            if reset_at <= now:
+                reset_at = reset_at + timedelta(days=1)
+            wait = int((reset_at - now).total_seconds()) + 60  # +1min buffer
+            if wait <= 0 or wait > self._MAX_RATE_LIMIT_WAIT:
+                return None
+            return wait
+
+        # Absolute UTC wall-clock format (legacy behavior).
         match = re.search(r"resets\s+(\d{1,2})(am|pm)\s*\(UTC\)", output, re.IGNORECASE)
-        if not match:
-            return None
-        hour = int(match.group(1))
-        ampm = match.group(2).lower()
-        if ampm == "pm" and hour != 12:
-            hour += 12
-        elif ampm == "am" and hour == 12:
-            hour = 0
+        if match:
+            hour = int(match.group(1))
+            ampm = match.group(2).lower()
+            if ampm == "pm" and hour != 12:
+                hour += 12
+            elif ampm == "am" and hour == 12:
+                hour = 0
 
-        now = datetime.now(timezone.utc)
-        reset = now.replace(hour=hour, minute=0, second=0, microsecond=0)
-        if reset <= now:
-            reset = reset.replace(day=reset.day + 1)  # next day
-        wait = int((reset - now).total_seconds()) + 60  # +1min buffer
-        return wait
+            reset = now_utc.replace(hour=hour, minute=0, second=0, microsecond=0)
+            wait = _candidate_wait(reset, now_utc)
+            if wait is not None:
+                return wait
+
+        # Absolute wall-clock format without a timezone, e.g. "try again at 10:08 AM".
+        # These messages are ambiguous across providers. We treat them as "the soonest
+        # plausible future wall-clock reset" across UTC and the local timezone, bounded
+        # by _MAX_RATE_LIMIT_WAIT. This matches observed OAuth agent messages where the
+        # printed clock time behaves like a near-future reset rather than a same-day
+        # local wall time many hours away.
+        match = re.search(
+            r"(?:try again|retry(?:ing)?(?:\s+after)?|wait(?:ing)?)\s+at\s+"
+            r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)(?:\s*\((UTC|GMT)\))?",
+            output,
+            re.IGNORECASE,
+        )
+        if match:
+            hour = int(match.group(1))
+            minute = int(match.group(2) or 0)
+            ampm = match.group(3).lower()
+            zone = (match.group(4) or "").upper()
+            if ampm == "pm" and hour != 12:
+                hour += 12
+            elif ampm == "am" and hour == 12:
+                hour = 0
+
+            if zone in {"UTC", "GMT"}:
+                reset = now_utc.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                wait = _candidate_wait(reset, now_utc)
+                if wait is not None:
+                    return wait
+            else:
+                candidates = []
+                reset_utc = now_utc.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                wait_utc = _candidate_wait(reset_utc, now_utc)
+                if wait_utc is not None:
+                    candidates.append(wait_utc)
+
+                reset_local = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                wait_local = _candidate_wait(reset_local, now_local)
+                if wait_local is not None:
+                    candidates.append(wait_local)
+
+                if candidates:
+                    return min(candidates)
+
+        # Relative duration format, e.g. "resets in 5h", "try again in 45m".
+        duration_context = re.search(
+            r"(?:resets?|try again|retry(?:ing)?(?:\s+after)?|wait(?:ing)?)\D{0,20}"
+            r"((?:\d+\s*(?:hours?|hrs?|hr|h|minutes?|mins?|min|m|seconds?|secs?|sec|s)\s*){1,3})",
+            output,
+            re.IGNORECASE,
+        )
+        if duration_context:
+            duration_text = duration_context.group(1)
+            wait_seconds = 0
+            for amount, unit in re.findall(
+                r"(\d+)\s*(hours?|hrs?|hr|h|minutes?|mins?|min|m|seconds?|secs?|sec|s)",
+                duration_text,
+                re.IGNORECASE,
+            ):
+                value = int(amount)
+                unit_lower = unit.lower()
+                if unit_lower.startswith(("h", "hr")):
+                    wait_seconds += value * 3600
+                elif unit_lower.startswith(("m", "min")):
+                    wait_seconds += value * 60
+                else:
+                    wait_seconds += value
+            if wait_seconds > 0:
+                return min(wait_seconds + 60, self._MAX_RATE_LIMIT_WAIT)
+
+        # Retry-After style: "retry after 3600" (seconds).
+        retry_after = re.search(r"retry[-_ ]?after\D{0,5}(\d{1,6})\b", output, re.IGNORECASE)
+        if retry_after:
+            return min(int(retry_after.group(1)) + 60, self._MAX_RATE_LIMIT_WAIT)
+
+        return None
 
     def refresh_container_credentials(self) -> bool:
-        """Copy fresh OAuth credentials from host into the container.
+        """Refresh credentials for the current agent by copying host files into container."""
+        if self.agent_name == "claude-code":
+            return self._refresh_claude_credentials()
+        if self.agent_name == "codex":
+            return self._refresh_codex_credentials()
 
-        Reads ~/.claude/.credentials.json from the host and copies it to
-        /home/fakeroot/.claude/.credentials.json inside the container.
-        This handles the case where the bind-mounted file becomes stale
-        due to inode changes from Claude CLI token refresh.
+        self.logger.info("Credential refresh is not supported for agent '%s'", self.agent_name)
+        return False
 
-        Returns:
-            True if credentials were refreshed successfully.
-        """
+    def _copy_host_file_to_container(self, host_path: Path, container_path: str, chmod_mode: str = "600") -> bool:
+        """Copy a host file into container and set fakeroot ownership."""
+        container_dir = str(Path(container_path).parent)
+        mkdir_result = subprocess.run(
+            ["docker", "exec", self.container_name, "mkdir", "-p", container_dir],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if mkdir_result.returncode != 0:
+            self.logger.error("Failed to create container directory %s: %s", container_dir, mkdir_result.stderr.strip())
+            return False
+
+        copy_result = subprocess.run(
+            ["docker", "cp", str(host_path), f"{self.container_name}:{container_path}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if copy_result.returncode != 0:
+            self.logger.error("docker cp failed for %s: %s", host_path, copy_result.stderr.strip())
+            return False
+
+        subprocess.run(
+            ["docker", "exec", self.container_name, "chown", "fakeroot:fakeroot", container_path],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        subprocess.run(
+            ["docker", "exec", self.container_name, "chmod", chmod_mode, container_path],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return True
+
+    def _refresh_claude_credentials(self) -> bool:
+        """Copy fresh Claude OAuth credentials from host into container."""
         host_creds = Path.home() / ".claude" / ".credentials.json"
         if not host_creds.exists():
             self.logger.warning("No host credentials file found at %s", host_creds)
             return False
 
         try:
-            # Verify host token is not expired
             creds_data = json.loads(host_creds.read_text(encoding="utf-8"))
             oauth = creds_data.get("claudeAiOauth", {})
             expires_at = oauth.get("expiresAt", 0)
@@ -174,40 +422,52 @@ class AgentRunner:
                 )
                 return False
 
-            # docker cp to container
-            container_dest = f"{self.container_name}:/home/fakeroot/.claude/.credentials.json"
-            result = subprocess.run(
-                ["docker", "cp", str(host_creds), container_dest],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode != 0:
-                self.logger.error("docker cp credentials failed: %s", result.stderr.strip())
+            if not self._copy_host_file_to_container(host_creds, "/home/fakeroot/.claude/.credentials.json"):
                 return False
 
-            # Fix ownership (fakeroot user)
-            subprocess.run(
-                [
-                    "docker",
-                    "exec",
-                    self.container_name,
-                    "chown",
-                    "fakeroot:fakeroot",
-                    "/home/fakeroot/.claude/.credentials.json",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-
-            remaining_h = round((expires_at - now_ms) / 3600_000, 1)
-            self.logger.info("🔑 Refreshed container credentials from host (valid for %.1fh)", remaining_h)
-            self._append_session_history({"event": "credentials_refreshed", "expires_in_hours": remaining_h})
+            if expires_at:
+                remaining_h = round((expires_at - now_ms) / 3600_000, 1)
+                self.logger.info("🔑 Refreshed Claude credentials from host (valid for %.1fh)", remaining_h)
+                self._append_session_history(
+                    {"event": "credentials_refreshed", "provider": "claude", "expires_in_hours": remaining_h}
+                )
+            else:
+                self.logger.info("🔑 Refreshed Claude credentials from host")
+                self._append_session_history({"event": "credentials_refreshed", "provider": "claude"})
             return True
-
         except Exception as e:
-            self.logger.error("Failed to refresh container credentials: %s", e)
+            self.logger.error("Failed to refresh Claude credentials: %s", e)
+            return False
+
+    def _refresh_codex_credentials(self) -> bool:
+        """Copy fresh Codex OAuth files from host into container."""
+        host_codex_dir = Path.home() / ".codex"
+        host_auth = host_codex_dir / "auth.json"
+        host_config = host_codex_dir / "config.toml"
+
+        if not host_auth.exists():
+            self.logger.warning("No host Codex auth file found at %s", host_auth)
+            return False
+
+        try:
+            auth_data = json.loads(host_auth.read_text(encoding="utf-8"))
+            if not isinstance(auth_data, dict):
+                self.logger.error("Host Codex auth file is not a JSON object: %s", host_auth)
+                return False
+            if "tokens" not in auth_data and "OPENAI_API_KEY" not in auth_data:
+                self.logger.warning("Host Codex auth file has unexpected format: %s", host_auth)
+
+            if not self._copy_host_file_to_container(host_auth, "/home/fakeroot/.codex/auth.json"):
+                return False
+
+            if host_config.exists():
+                self._copy_host_file_to_container(host_config, "/home/fakeroot/.codex/config.toml")
+
+            self.logger.info("🔑 Refreshed Codex OAuth credentials from host")
+            self._append_session_history({"event": "credentials_refreshed", "provider": "codex"})
+            return True
+        except Exception as e:
+            self.logger.error("Failed to refresh Codex credentials: %s", e)
             return False
 
     def _run_command(self, cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -328,6 +588,12 @@ class AgentRunner:
             return success, self.session_id
         except Exception as e:
             self.logger.error(f"Failed to execute agent: {e}")
+            self._last_auth_error = False
+            self._last_rate_limit = False
+            self._rate_limit_reset_seconds = None
+            self._last_model_unavailable = False
+            self._last_model_hint = None
+            self._last_invalid_session = False
             self._append_session_history({"event": "agent_exec_end", "session_id": self.session_id, "success": False})
             self._run_command(["docker", "exec", self.container_name, "rm", "-f", container_prompt_path], check=False)
             return False, self.session_id
@@ -335,19 +601,32 @@ class AgentRunner:
     def _update_session_id_from_output(self) -> None:
         """Update session_id from agent output if the framework provides extraction.
 
-        For Codex, this extracts thread_id from stdout JSON.
-        For Gemini, this extracts session_id from stdout JSON.
+        For Codex, this extracts thread_id from stdout JSON or container rollout files.
+        For Gemini, this extracts session_id from stdout JSON or container session files.
         For Claude Code, the session_id is passed in, so no update needed.
 
-        Tries stdout first, then falls back to stderr (agents may write session
-        info to stderr on crash, e.g. Gemini CLI Body Timeout).
+        Extraction priority:
+        1. Container files (authoritative, per-session)
+        2. stdout parsing (fallback, may contain stale IDs from previous runs)
+        3. stderr parsing (last resort, for crash scenarios)
+
+        Cross-validates container vs stdout when both are available.
         """
         if not self.log_dir:
             return
 
-        extracted_id = None
+        container_id = None
+        stdout_id = None
 
-        # Determine which extraction method to use
+        # 1. Try container file extraction (authoritative)
+        try:
+            container_id = self._framework.extract_session_id_from_container(self.container_name)
+            if container_id:
+                self.logger.info(f"Extracted session_id from container files: {container_id[:8]}...")
+        except Exception as e:
+            self.logger.warning(f"Container session extraction failed: {e}")
+
+        # 2. Try stdout/stderr extraction (fallback)
         if hasattr(self._framework, "extract_thread_id"):
             extract_fn = self._framework.extract_thread_id
             id_label = "thread_id"
@@ -355,24 +634,35 @@ class AgentRunner:
             extract_fn = self._framework.extract_session_id
             id_label = "session_id"
         else:
-            return
+            extract_fn = None
+            id_label = None
 
-        # Try stdout first
-        stdout_file = self.log_dir / "agent_stdout.txt"
-        if stdout_file.exists():
-            stdout_content = stdout_file.read_text(encoding="utf-8")
-            extracted_id = extract_fn(stdout_content)
-            if extracted_id:
-                self.logger.info(f"Extracted {id_label} from stdout: {extracted_id[:8]}...")
+        if extract_fn:
+            # Try stdout first
+            stdout_file = self.log_dir / "agent_stdout.txt"
+            if stdout_file.exists():
+                stdout_content = stdout_file.read_text(encoding="utf-8")
+                stdout_id = extract_fn(stdout_content)
+                if stdout_id:
+                    self.logger.info(f"Extracted {id_label} from stdout: {stdout_id[:8]}...")
 
-        # Fallback to stderr if stdout extraction failed
-        if not extracted_id:
-            stderr_file = self.log_dir / "agent_stderr.txt"
-            if stderr_file.exists():
-                stderr_content = stderr_file.read_text(encoding="utf-8")
-                extracted_id = extract_fn(stderr_content)
-                if extracted_id:
-                    self.logger.info(f"Extracted {id_label} from stderr (fallback): {extracted_id[:8]}...")
+            # Fallback to stderr if stdout extraction failed
+            if not stdout_id:
+                stderr_file = self.log_dir / "agent_stderr.txt"
+                if stderr_file.exists():
+                    stderr_content = stderr_file.read_text(encoding="utf-8")
+                    stdout_id = extract_fn(stderr_content)
+                    if stdout_id:
+                        self.logger.info(f"Extracted {id_label} from stderr (fallback): {stdout_id[:8]}...")
+
+        # 3. Cross-validate and select
+        if container_id and stdout_id and container_id != stdout_id:
+            self.logger.warning(
+                f"Session ID mismatch: container={container_id[:8]}... vs stdout={stdout_id[:8]}... "
+                f"Using container value (authoritative)"
+            )
+
+        extracted_id = container_id or stdout_id
 
         if extracted_id:
             old_id = self.session_id
@@ -456,6 +746,7 @@ class AgentRunner:
             stderr_thread.join()
 
             stdout = "".join(list(stdout_lines.queue))
+            stderr = "".join(list(stderr_lines.queue))
 
         finally:
             stdout_file.close()
@@ -467,35 +758,40 @@ class AgentRunner:
         if proc.returncode != 0:
             self.logger.error(f"Agent exited with code {proc.returncode}")
             self.logger.error(f"Check logs in: {self.log_dir}")
-            # Check if this was an authentication error
-            self._last_auth_error = self._detect_auth_error(stdout)
-            if self._last_auth_error:
-                self.logger.warning("🔑 Authentication error detected in agent output")
-            # Check if this was a rate limit error
-            self._last_rate_limit = self._detect_rate_limit(stdout)
-            if self._last_rate_limit:
-                self._rate_limit_reset_seconds = self._parse_rate_limit_reset(stdout)
-                self.logger.warning("⏳ Rate limit detected in agent output")
+            output_for_detection = f"{stdout}\n{stderr}"
+            self._classify_failure_signals(output_for_detection, "agent")
             return False
 
         self._last_auth_error = False
         self._last_rate_limit = False
         self._rate_limit_reset_seconds = None
+        self._last_model_unavailable = False
+        self._last_model_hint = None
+        self._last_invalid_session = False
         self.logger.info("Agent execution completed successfully")
         return True
 
-    def resume_session(self, session_id: str, message: str) -> bool:
+    def resume_session(self, session_id: str, message: str, timeout_ms: Optional[int] = None) -> bool:
         """Resume an existing session with a message.
 
         Args:
             session_id: Session ID to resume
             message: Message to send
+            timeout_ms: Optional timeout override for this resume call
 
         Returns:
             True if successful
         """
+        effective_timeout_ms = timeout_ms if timeout_ms is not None else self.timeout_ms
         self.logger.info(f"Resuming session {session_id[:8]}...")
+        self.logger.info(f"Resume timeout: {effective_timeout_ms / 1000 / 60:.1f} minutes")
         self._append_session_history({"event": "resume_attempt", "session_id": session_id})
+        self._last_auth_error = False
+        self._last_rate_limit = False
+        self._rate_limit_reset_seconds = None
+        self._last_model_unavailable = False
+        self._last_model_hint = None
+        self._last_invalid_session = False
 
         # Write message to temp file
         if self.log_dir:
@@ -554,7 +850,7 @@ class AgentRunner:
                 docker_exec_cmd,
                 capture_output=True,
                 text=True,
-                timeout=self.timeout_ms / 1000.0,
+                timeout=effective_timeout_ms / 1000.0,
             )
 
             # Save output to files
@@ -575,6 +871,8 @@ class AgentRunner:
             if result.returncode != 0:
                 self.logger.error(f"Resume failed with code {result.returncode}")
                 self.logger.error(f"stderr: {result.stderr}")
+                output_for_detection = f"{result.stdout or ''}\n{result.stderr or ''}"
+                self._classify_failure_signals(output_for_detection, "resume")
                 self._append_session_history({"event": "agent_exec_end", "session_id": session_id, "success": False})
                 self._append_session_history(
                     {
@@ -592,13 +890,33 @@ class AgentRunner:
             return True
 
         except subprocess.TimeoutExpired:
-            self.logger.error("Resume timed out")
+            timeout_minutes = effective_timeout_ms / 1000 / 60
+            self.logger.error(f"Resume timed out after {timeout_minutes:.1f} minutes")
+            self._last_auth_error = False
+            self._last_rate_limit = False
+            self._rate_limit_reset_seconds = None
+            self._last_model_unavailable = False
+            self._last_model_hint = None
+            self._last_invalid_session = False
             self._append_session_history({"event": "agent_exec_end", "session_id": session_id, "success": False})
             self._run_command(["docker", "exec", self.container_name, "rm", "-f", container_message_path], check=False)
-            self._append_session_history({"event": "resume_failure", "session_id": session_id, "reason": "timeout"})
+            self._append_session_history(
+                {
+                    "event": "resume_failure",
+                    "session_id": session_id,
+                    "reason": "timeout",
+                    "timeout_ms": effective_timeout_ms,
+                }
+            )
             return False
         except Exception as e:
             self.logger.error(f"Failed to resume session: {e}")
+            self._last_auth_error = False
+            self._last_rate_limit = False
+            self._rate_limit_reset_seconds = None
+            self._last_model_unavailable = False
+            self._last_model_hint = None
+            self._last_invalid_session = False
             self._append_session_history({"event": "agent_exec_end", "session_id": session_id, "success": False})
             self._append_session_history({"event": "resume_failure", "session_id": session_id, "reason": str(e)})
             return False
@@ -676,6 +994,7 @@ class E2EAgentRunner(AgentRunner):
             log_dir=log_dir,
             agent_name=agent_name,  # Pass framework name to parent
             reasoning_effort=reasoning_effort,
+            include_directories=["/e2e_workspace"],
         )
 
         self.repo_src_dirs = repo_src_dirs
@@ -920,7 +1239,7 @@ class E2EAgentRunner(AgentRunner):
             self.logger.warning(f"Failed to detect untagged commits: {e}")
             return {}
 
-    def send_recover_message(self, has_new_tasks: bool = True) -> bool:
+    def send_recover_message(self, has_new_tasks: bool = True, timeout_ms: Optional[int] = None) -> bool:
         """Send a recover message to wake up the agent.
 
         Uses the same session ID to continue the existing conversation.
@@ -928,6 +1247,7 @@ class E2EAgentRunner(AgentRunner):
 
         Args:
             has_new_tasks: Whether new tasks have been released in the DAG.
+            timeout_ms: Optional timeout override for this recover/resume call.
 
         Returns:
             True if successful, False otherwise
@@ -1002,7 +1322,7 @@ class E2EAgentRunner(AgentRunner):
             final_prompt = final_prompt.replace("{{header_content}}", header_content)
             final_prompt = final_prompt.replace("{{tag_reminder}}", tag_reminder)
 
-        return self.resume_session(self.session_id, final_prompt)
+        return self.resume_session(self.session_id, final_prompt, timeout_ms=timeout_ms)
 
     def _extract_agent_trace(self) -> bool:
         """Extract agent trace using claude-extract inside container."""

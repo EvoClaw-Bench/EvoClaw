@@ -1,29 +1,118 @@
 #!/usr/bin/env python3
 """
-Compare milestone results across multiple trials and select the best result for each milestone.
+Compare milestone or e2e results across trials and print summary tables.
 
 Usage:
-    # For mstone trials (default):
-    python scripts/compare_milestone_trials.py \
-        --workspace-root DATA/harness_workspace/navidrome_navidrome_v0.57.0_v0.58.0/baseline_004_v4 \
+    # mstone trials (default --trial-type mstone)
+    python harness/e2e/collect_results.py \\
+        --workspace-root DATA/harness_workspace/<repo_name>/<workspace> \\
         --trials complete_run_001 complete_run_002
 
-    # For e2e trials:
-    python scripts/compare_milestone_trials.py \
-        --workspace-root DATA/harness_workspace/apache_dubbo_dubbo-3.3.3_dubbo-3.3.6/baseline_rerun_stage4_002_fix2_v2 \
-        --trials complete_run_001 complete_run_002 \
-        --trial-type e2e  # or mstone
+    # e2e trials
+    python harness/e2e/collect_results.py \\
+        --workspace-root DATA/harness_workspace/<repo_name>/<workspace> \\
+        --trials <trial_name> \\
+        --trial-type e2e
+
+    # aggregate across repos (reads ``analysis/extract/config.py`` unless ``--config`` is set)
+    python harness/e2e/collect_results.py --multi-repo [--trials TRIAL ...] [--config-repos KEY ...]
+
+Result files:
+    Prefers ``evaluation_result_filtered.json`` when present; pass ``--non-filter`` to use
+    ``evaluation_result.json`` only.
 
 Output:
-    ASCII table with best results for each milestone
+    ASCII tables (per-milestone detail, optional per-trial comparison, multi-repo summary).
 """
 
 import argparse
 import json
+import re
 import sys
 import unicodedata
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional
+
+
+# Canonical pricing per model family (USD per million tokens).
+# Used as fallback when Claude Code's internal pricing table assigns
+# incorrect prices to newer model versions within the same family
+# (e.g., sonnet-4.6 charged at $5/$25 instead of $3/$15).
+MODEL_FAMILY_PRICING = {
+    "haiku": {
+        "input": 1.0,
+        "output": 5.0,
+        "cache_read": 0.10,
+        "cache_write": 1.25,
+    },
+    "sonnet": {
+        "input": 3.0,
+        "output": 15.0,
+        "cache_read": 0.30,
+        "cache_write": 3.75,
+    },
+    "opus": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.50,
+        "cache_write": 6.25,
+    },
+}
+
+
+def _detect_model_family(model_id: str) -> Optional[str]:
+    """Detect model family from model ID string.
+
+    Examples:
+        claude-haiku-4-5-20251001 → haiku
+        claude-sonnet-4-5-20250929 → sonnet
+        claude-sonnet-4-6 → sonnet
+        claude-opus-4-6 → opus
+    """
+    model_lower = model_id.lower()
+    for family in ["haiku", "sonnet", "opus"]:
+        if family in model_lower:
+            return family
+    return None
+
+
+def _calculate_cost_from_tokens(usage: Dict, pricing: Dict) -> float:
+    """Calculate cost from token counts and pricing."""
+    return (
+        usage.get("inputTokens", 0) * pricing["input"] / 1e6
+        + usage.get("outputTokens", 0) * pricing["output"] / 1e6
+        + usage.get("cacheReadInputTokens", 0) * pricing["cache_read"] / 1e6
+        + usage.get("cacheCreationInputTokens", 0) * pricing["cache_write"] / 1e6
+    )
+
+
+def recalculate_cost_from_model_usage(model_usage: Dict) -> Optional[float]:
+    """Recalculate total cost from modelUsage using canonical family pricing.
+
+    For each model in modelUsage:
+    - Detect its family (haiku/sonnet/opus)
+    - Recalculate cost using canonical family pricing
+    - If family is unknown, keep the original costUSD
+
+    Returns recalculated total cost, or None if modelUsage is empty/missing.
+    """
+    if not model_usage:
+        return None
+
+    total_cost = 0.0
+    for model_id, usage in model_usage.items():
+        if not isinstance(usage, dict):
+            continue
+
+        family = _detect_model_family(model_id)
+        if family is None:
+            # Unknown family - keep original cost
+            total_cost += usage.get("costUSD", 0)
+            continue
+
+        total_cost += _calculate_cost_from_tokens(usage, MODEL_FAMILY_PRICING[family])
+
+    return total_cost
 
 
 def load_non_graded_milestones(workspace_root: Path) -> Set[str]:
@@ -129,8 +218,13 @@ def load_agent_stats(milestone_dir: Path) -> Dict:
             if "wall_clock_ms" not in summary and duration_ms and duration_ms > 0:
                 duration_ms = _recompute_active_duration(stats) or duration_ms
 
+            # Recalculate cost using canonical family pricing if modelUsage available
+            cost = recalculate_cost_from_model_usage(stats.get("modelUsage", {}))
+            if cost is None:
+                cost = summary.get("total_cost_usd")
+
             return {
-                "cost": summary.get("total_cost_usd"),
+                "cost": cost,
                 "turns": summary.get("total_turns"),
                 "duration": duration_ms if duration_ms and duration_ms > 0 else None,
                 "agent_framework": stats.get("agent_framework"),
@@ -239,8 +333,35 @@ def format_duration(duration_ms: Optional[int]) -> str:
     return f"{minutes:.2f} min"
 
 
+def load_e2e_trial_submission_counts(workspace_root: Path, trial: str) -> tuple[int, int]:
+    """Load total milestone count and submitted (tagged) count from e2e trial.
+
+    Retries (e.g. M003.1-retry1) are deduplicated to count unique base milestones.
+    Returns (total_milestones, submitted_count). Defaults to (0, 0) if unavailable.
+    """
+    summary_path = workspace_root / "e2e_trial" / trial / "evaluation" / "summary.json"
+    if not summary_path.exists():
+        return 0, 0
+    try:
+        with open(summary_path) as f:
+            summary = json.load(f)
+        total = summary.get("total_milestones", 0)
+        # Deduplicate retries to count unique base milestones
+        base_ids = {_strip_retry_suffix(k) for k in summary.get("results", {})}
+        return total, len(base_ids)
+    except Exception:
+        return 0, 0
+
+
 def load_e2e_trial_cost(workspace_root: Path, trial: str) -> Optional[float]:
     """Load total cost from e2e trial's agent_stats.json.
+
+    For claude-code trials: recalculates from modelUsage with canonical family
+    pricing, to correct for newer model versions that may have incorrect
+    internal pricing in Claude Code's billing.
+
+    For openhands trials: uses litellm-computed costUSD directly, which is
+    already accurate for all models.
 
     Returns total cost in USD or None if not available.
     """
@@ -250,6 +371,14 @@ def load_e2e_trial_cost(workspace_root: Path, trial: str) -> Optional[float]:
     try:
         with open(stats_path) as f:
             stats = json.load(f)
+
+            # Only recalculate for claude-code trials (internal pricing may be wrong)
+            # For openhands trials, litellm cost is already accurate
+            if trial.startswith("_claude-code_"):
+                cost = recalculate_cost_from_model_usage(stats.get("modelUsage", {}))
+                if cost is not None:
+                    return cost
+
             return stats.get("summary", {}).get("total_cost_usd")
     except Exception:
         return None
@@ -267,6 +396,38 @@ def load_e2e_trial_turns(workspace_root: Path, trial: str) -> Optional[int]:
         with open(stats_path) as f:
             stats = json.load(f)
             return stats.get("summary", {}).get("total_turns")
+    except Exception:
+        return None
+
+
+def load_e2e_trial_output_tokens(workspace_root: Path, trial: str) -> Optional[int]:
+    """Load total output tokens from e2e trial's agent_stats.json.
+
+    Sums outputTokens + thoughtsTokens (Gemini) + reasoningOutputTokens (Codex)
+    + reasoningTokens (OpenHands) across all models in modelUsage.
+
+    Returns total output tokens or None if not available.
+    """
+    stats_path = workspace_root / "e2e_trial" / trial / "agent_stats.json"
+    if not stats_path.exists():
+        return None
+    try:
+        with open(stats_path) as f:
+            stats = json.load(f)
+        model_usage = stats.get("modelUsage", {})
+        if not model_usage:
+            return None
+        total = 0
+        for m in model_usage.values():
+            if not isinstance(m, dict):
+                continue
+            total += (
+                m.get("outputTokens", 0)
+                + m.get("thoughtsTokens", 0)
+                + m.get("reasoningOutputTokens", 0)
+                + m.get("reasoningTokens", 0)
+            )
+        return total if total > 0 else None
     except Exception:
         return None
 
@@ -446,23 +607,23 @@ def format_p2p(result: Dict) -> str:
 def get_status(result: Dict) -> str:
     """Get milestone status."""
     if not result:
-        return "❌ 未运行"
+        return "❌ Not run"
 
     # Check for e2e not_run status first (before compilation check)
     if result.get("eval_status") == "not_run":
-        return "⏳ 未运行"
+        return "⏳ Not run"
 
     # Check for synthetic results (agent timeout/killed, no evaluation produced)
     if result.get("_synthetic"):
         failure_reason = result.get("_failure_reason", "unknown")
         if failure_reason == "compilation_failure":
-            return "❌ 编译失败"
+            return "❌ Build failed"
         elif failure_reason == "no_result":
-            return "❌ 运行失败"
-        return "❌ 未知错误"
+            return "❌ Run failed"
+        return "❌ Unknown error"
 
     if check_compilation_failure(result):
-        return "❌ 编译失败"
+        return "❌ Build failed"
 
     # Check for e2e error status
     if result.get("eval_status") == "error":
@@ -477,27 +638,27 @@ def get_status(result: Dict) -> str:
 def get_failure_note(result: Dict, milestone_id: str = "") -> str:
     """Generate a brief note explaining the failure reason."""
     if not result:
-        return "未运行"
+        return "Not run"
 
     # Check for e2e not_run status first
     if result.get("eval_status") == "not_run":
-        return "未运行"
+        return "Not run"
 
     # Check for synthetic results
     if result.get("_synthetic"):
         failure_reason = result.get("_failure_reason", "unknown")
         if failure_reason == "compilation_failure":
-            return "编译失败(无测试报告)"
+            return "Build failed (no test report)"
         elif failure_reason == "no_result":
-            return "运行失败"
-        return "未知错误"
+            return "Run failed"
+        return "Unknown error"
 
     if check_compilation_failure(result):
-        return "编译失败"
+        return "Build failed"
 
     # Check for e2e error status
     if result.get("eval_status") == "error":
-        error_msg = result.get("error", "评估错误")
+        error_msg = result.get("error", "Eval error")
         return error_msg[:25] if len(error_msg) > 25 else error_msg
 
     if is_resolved(result):
@@ -521,18 +682,18 @@ def get_failure_note(result: Dict, milestone_id: str = "") -> str:
     # Check N2P
     if n2p_r > 0:
         if n2p_a == 0:
-            issues.append(f"N2P未完成")
+            issues.append(f"N2P incomplete")
         elif n2p_a < n2p_r:
             issues.append(f"N2P-{n2p_r - n2p_a}")
 
     # Check P2P
     if p2p_failed > 0:
-        issues.append(f"{p2p_failed}回归")
+        issues.append(f"{p2p_failed} regressed")
     if p2p_missing > 0:
-        issues.append(f"{p2p_missing}缺失")
+        issues.append(f"{p2p_missing} missing")
 
     if not issues:
-        return "其他原因"
+        return "Other"
 
     return ", ".join(issues)
 
@@ -672,10 +833,25 @@ def find_milestones(workspace_root: Path, trials: List[str]) -> List[str]:
     return sorted(milestones, key=sort_milestone_key)
 
 
+def _strip_retry_suffix(milestone_id: str) -> str:
+    """Strip '-retry{N}' suffix from milestone ID to get the base ID.
+
+    e.g. 'milestone_core_development.3-retry1' -> 'milestone_core_development.3'
+    """
+    return re.sub(r"-retry\d+$", "", milestone_id)
+
+
+def _get_retry_attempt(milestone_id: str) -> int:
+    """Extract retry attempt number from milestone ID. Returns 0 for base IDs."""
+    m = re.search(r"-retry(\d+)$", milestone_id)
+    return int(m.group(1)) if m else 0
+
+
 def find_milestones_e2e(workspace_root: Path, trials: List[str]) -> List[str]:
     """Find all milestones across the given e2e trials.
 
     Checks both summary.json and individual evaluation directories.
+    Retry suffixes (-retry1, -retry2, ...) are stripped to base milestone IDs.
     """
     milestones = set()
 
@@ -689,7 +865,7 @@ def find_milestones_e2e(workspace_root: Path, trials: List[str]) -> List[str]:
                 with open(summary_path) as f:
                     summary = json.load(f)
                     results = summary.get("results", {})
-                    milestones.update(results.keys())
+                    milestones.update(_strip_retry_suffix(k) for k in results.keys())
             except Exception as e:
                 print(f"Warning: Failed to load {summary_path}: {e}", file=sys.stderr)
 
@@ -698,7 +874,7 @@ def find_milestones_e2e(workspace_root: Path, trials: List[str]) -> List[str]:
             for item in eval_dir.iterdir():
                 if item.is_dir() and item.name.startswith("M"):
                     if (item / "evaluation_result.json").exists():
-                        milestones.add(item.name)
+                        milestones.add(_strip_retry_suffix(item.name))
 
     return sorted(milestones, key=sort_milestone_key)
 
@@ -721,21 +897,32 @@ def load_e2e_results(
     eval_dir = workspace_root / "e2e_trial" / trial / "evaluation"
 
     # First, load from summary.json
+    raw_results = {}
     summary_path = eval_dir / "summary.json"
     if summary_path.exists():
         try:
             with open(summary_path) as f:
                 summary = json.load(f)
-                results = summary.get("results", {})
+                raw_results = summary.get("results", {})
         except Exception as e:
             print(f"Warning: Failed to load {summary_path}: {e}", file=sys.stderr)
+
+    # Merge retry keys into base milestone IDs, keeping only the latest attempt.
+    # e.g. if both "M001" (attempt 0) and "M001-retry1" (attempt 1) exist,
+    # keep only the retry1 result under key "M001".
+    for raw_key, raw_val in raw_results.items():
+        base_id = _strip_retry_suffix(raw_key)
+        attempt = raw_val.get("attempt", _get_retry_attempt(raw_key))
+        if base_id not in results or attempt > results[base_id].get("attempt", 0):
+            results[base_id] = raw_val
 
     # Then, check ALL evaluation_result files to supplement or correct results
     # The evaluation_result.json 'resolved' field is the authoritative source
     if eval_dir.exists():
         for item in eval_dir.iterdir():
             if is_milestone_dir(item):
-                milestone_id = item.name
+                dir_name = item.name
+                base_id = _strip_retry_suffix(dir_name)
                 result_file = item / "evaluation_result.json"
 
                 # Try to load the result (filtered or unfiltered based on preference)
@@ -745,9 +932,9 @@ def load_e2e_results(
                     resolved = eval_result.get("resolved", False)
                     correct_status = "passed" if resolved else "failed"
 
-                    if milestone_id not in results:
+                    if base_id not in results:
                         # Add new result from evaluation_result.json
-                        results[milestone_id] = {
+                        results[base_id] = {
                             "eval_status": correct_status,
                             "test_summary": eval_result.get("test_summary", {}),
                             "_from_eval_result": True,
@@ -756,12 +943,12 @@ def load_e2e_results(
                             result_type_counts[result_type] += 1
                     else:
                         # Correct eval_status if it doesn't match resolved field
-                        if results[milestone_id].get("eval_status") != correct_status:
-                            results[milestone_id]["eval_status"] = correct_status
-                            results[milestone_id]["_corrected"] = True
+                        if results[base_id].get("eval_status") != correct_status:
+                            results[base_id]["eval_status"] = correct_status
+                            results[base_id]["_corrected"] = True
                         # Replace test_summary with filtered data when available
                         if result_type == "filtered":
-                            results[milestone_id]["test_summary"] = eval_result.get("test_summary", {})
+                            results[base_id]["test_summary"] = eval_result.get("test_summary", {})
                             result_type_counts["filtered"] += 1
 
     return results, result_type_counts
@@ -932,7 +1119,7 @@ def compare_trials_e2e(
         trials: List of trial names to compare
         prefer_filtered: Whether to prefer filtered results
         selected_milestones: Optional set of selected milestone IDs to include
-            even if they have no results (will show as "未运行")
+            even if they have no results (will show as "Not run")
 
     Returns:
         Tuple of (best_results, result_type_counts) where result_type_counts
@@ -1004,6 +1191,258 @@ def compare_trials_e2e(
             total_type_counts["synthetic"] += 1
 
     return best_results, total_type_counts
+
+
+def compute_repo_summary(
+    workspace_root: Path,
+    trials: List[str],
+    trial_type: str = "e2e",
+    prefer_filtered: bool = True,
+) -> Dict:
+    """Compute aggregate metrics for a single repo across given trials.
+
+    Returns dict with keys: graded, resolved, resolve_pct,
+    score_1000, score_full, score_reliable, cost, duration, turns,
+    total_milestones, submitted.
+    """
+    selected_milestones, _ = load_selected_milestones(workspace_root)
+    non_graded = load_non_graded_milestones(workspace_root)
+
+    include_selected = selected_milestones
+
+    if trial_type == "e2e":
+        results, _ = compare_trials_e2e(workspace_root, trials, prefer_filtered, include_selected)
+    else:
+        results, _ = compare_trials(workspace_root, trials, prefer_filtered)
+
+    if not results:
+        return {"error": True}
+
+    # Filter by selected milestones
+    if selected_milestones is not None:
+        results = {k: v for k, v in results.items() if k in selected_milestones}
+
+    resolved_count = 0
+    graded_count = 0
+    evaluated_count = 0
+    sum_score_1000 = 0.0
+    sum_score_full = 0.0
+    sum_score_reliable = 0.0
+    sum_precision = 0.0
+    sum_recall = 0.0
+
+    for milestone, data in results.items():
+        result = data["result"]
+        if milestone not in non_graded:
+            graded_count += 1
+            if result.get("eval_status") != "not_run":
+                evaluated_count += 1
+            if is_resolved(result):
+                resolved_count += 1
+            s1000 = calculate_score_v2(result)
+            sfull = calculate_score(result)
+            srel = calculate_score_reliable(result)
+            prec, rec = calculate_precision_recall(result)
+            if s1000 is not None:
+                sum_score_1000 += s1000
+            if sfull is not None:
+                sum_score_full += sfull
+            if srel is not None:
+                sum_score_reliable += srel
+            if prec is not None:
+                sum_precision += prec
+            if rec is not None:
+                sum_recall += rec
+
+    # Aggregate cost/duration/turns/output_tokens across trials
+    total_cost = 0.0
+    total_duration = 0
+    total_turns = 0
+    total_output_tokens = 0
+    total_ms = 0
+    total_submitted = 0
+
+    if trial_type == "e2e":
+        for trial in trials:
+            c = load_e2e_trial_cost(workspace_root, trial)
+            if c is not None:
+                total_cost += c
+            d = load_e2e_trial_duration(workspace_root, trial)
+            if d is not None:
+                total_duration += d
+            t = load_e2e_trial_turns(workspace_root, trial)
+            if t is not None:
+                total_turns += t
+            ot = load_e2e_trial_output_tokens(workspace_root, trial)
+            if ot is not None:
+                total_output_tokens += ot
+            ms, sub = load_e2e_trial_submission_counts(workspace_root, trial)
+            total_ms += ms
+            total_submitted += sub
+
+    return {
+        "error": False,
+        "graded": graded_count,
+        "evaluated": evaluated_count,
+        "resolved": resolved_count,
+        "resolve_pct": resolved_count * 100 / graded_count if graded_count > 0 else 0.0,
+        "score_1000": sum_score_1000 / graded_count * 100 if graded_count > 0 else 0.0,
+        "score_full": sum_score_full / graded_count * 100 if graded_count > 0 else 0.0,
+        "score_reliable": sum_score_reliable / graded_count * 100 if graded_count > 0 else 0.0,
+        "precision": sum_precision / graded_count * 100 if graded_count > 0 else 0.0,
+        "recall": sum_recall / graded_count * 100 if graded_count > 0 else 0.0,
+        "cost": total_cost if total_cost > 0 else None,
+        "duration": total_duration if total_duration > 0 else None,
+        "turns": total_turns if total_turns > 0 else None,
+        "output_tokens": total_output_tokens if total_output_tokens > 0 else None,
+        "total_milestones": total_ms,
+        "submitted": total_submitted,
+    }
+
+
+def print_multi_repo_table(summaries: List[Dict], trial_label: str = ""):
+    """Print a summary table aggregating results across multiple repos."""
+    if not summaries:
+        print("No results to display.")
+        return
+
+    valid = [s for s in summaries if not s.get("error")]
+    if not valid:
+        print("No valid results found for any repo.")
+        return
+
+    # Pre-compute display strings
+    resolve_strs = {}
+    done_strs = {}
+    for s in summaries:
+        if not s.get("error"):
+            resolve_strs[s["repo"]] = f"{s['resolve_pct']:.2f}% ({s['resolved']}/{s['graded']})"
+            done_strs[s["repo"]] = f"{s['evaluated']}/{s['graded']}"
+        else:
+            resolve_strs[s["repo"]] = "-"
+            done_strs[s["repo"]] = "-"
+
+    # Column widths
+    repo_w = max(len("Repo"), max(len(s["repo"]) for s in summaries)) + 2
+    resolve_w = max(10, max(len(v) for v in resolve_strs.values()) + 1)
+    done_w = max(6, max(len(v) for v in done_strs.values()) + 1)
+
+    cols = [
+        ("Done", done_w),
+        ("Score", 10),
+        ("Resolve", resolve_w),
+        ("Precision", 10),
+        ("Recall", 10),
+        ("Cost", 10),
+        ("Time", 12),
+        ("Turns", 8),
+        ("OutTok(k)", 10),
+    ]
+
+    def _build_row(values: List[str]) -> str:
+        """Build a table row from a list of cell values."""
+        all_widths = [repo_w] + [cw for _, cw in cols]
+        parts = []
+        for val, w in zip(values, all_widths):
+            parts.append(f" {val:<{w}} ")
+        return "\u2502" + "\u2502".join(parts) + "\u2502"
+
+    def _build_row_right(label: str, values: List[str]) -> str:
+        """Build a table row with left-aligned label and right-aligned values."""
+        all_widths = [repo_w] + [cw for _, cw in cols]
+        parts = [f" {label:<{all_widths[0]}} "]
+        for val, w in zip(values, all_widths[1:]):
+            parts.append(f" {val:>{w}} ")
+        return "\u2502" + "\u2502".join(parts) + "\u2502"
+
+    # Build separators
+    all_widths = [repo_w] + [cw for _, cw in cols]
+    sep_top = "\u250c" + "\u252c".join("\u2500" * (w + 2) for w in all_widths) + "\u2510"
+    sep_mid = "\u251c" + "\u253c".join("\u2500" * (w + 2) for w in all_widths) + "\u2524"
+    sep_bot = "\u2514" + "\u2534".join("\u2500" * (w + 2) for w in all_widths) + "\u2518"
+
+    # Header
+    header_vals = ["Repo"] + [cn for cn, _ in cols]
+    header = _build_row(header_vals)
+
+    if trial_label:
+        print(f"\n\U0001f3c3 Trial: {trial_label}")
+    print()
+    print(sep_top)
+    print(header)
+    print(sep_mid)
+
+    # Accumulators for average
+    n_valid = 0
+    avg_score = 0.0
+    avg_prec = 0.0
+    avg_rec = 0.0
+    avg_resolve = 0.0
+    sum_cost = 0.0
+    sum_dur = 0
+    sum_turns = 0
+    sum_out_tok = 0
+
+    for s in summaries:
+        repo = s["repo"]
+        if s.get("error"):
+            print(_build_row_right(repo, ["-"] * len(cols)))
+            continue
+
+        n_valid += 1
+        avg_score += s["score_reliable"]
+        avg_prec += s["precision"]
+        avg_rec += s["recall"]
+        avg_resolve += s["resolve_pct"]
+        if s["cost"] is not None:
+            sum_cost += s["cost"]
+        if s["duration"] is not None:
+            sum_dur += s["duration"]
+        if s["turns"] is not None:
+            sum_turns += s["turns"]
+        if s["output_tokens"] is not None:
+            sum_out_tok += s["output_tokens"]
+
+        cost_str = f"${s['cost']:.2f}" if s["cost"] is not None else "-"
+        dur_str = format_duration(s["duration"]) if s["duration"] else "-"
+        turns_str = str(s["turns"]) if s["turns"] else "-"
+        out_tok_str = f"{s['output_tokens'] / 1000:.1f}" if s["output_tokens"] else "-"
+
+        vals = [
+            done_strs[repo],
+            f"{s['score_reliable']:.2f}%",
+            resolve_strs[repo],
+            f"{s['precision']:.2f}%",
+            f"{s['recall']:.2f}%",
+            cost_str,
+            dur_str,
+            turns_str,
+            out_tok_str,
+        ]
+        print(_build_row_right(repo, vals))
+
+    # Average row
+    if n_valid > 0:
+        print(sep_mid)
+        avg_cost_str = f"${sum_cost / n_valid:.2f}" if sum_cost > 0 else "-"
+        avg_dur_str = format_duration(int(sum_dur / n_valid)) if sum_dur > 0 else "-"
+        avg_turns_str = str(int(sum_turns / n_valid)) if sum_turns > 0 else "-"
+        avg_out_tok_str = f"{sum_out_tok / n_valid / 1000:.1f}" if sum_out_tok > 0 else "-"
+
+        avg_vals = [
+            "",
+            f"{avg_score / n_valid:.2f}%",
+            f"{avg_resolve / n_valid:.2f}%",
+            f"{avg_prec / n_valid:.2f}%",
+            f"{avg_rec / n_valid:.2f}%",
+            avg_cost_str,
+            avg_dur_str,
+            avg_turns_str,
+            avg_out_tok_str,
+        ]
+        print(_build_row_right("AVERAGE", avg_vals))
+
+    print(sep_bot)
 
 
 def format_cost(cost: Optional[float]) -> str:
@@ -1105,6 +1544,90 @@ def calculate_score_v2(result: Dict) -> Optional[float]:
     return first_part * second_part
 
 
+def calculate_score_reliable(result: Dict) -> Optional[float]:
+    """Calculate milestone score_reliable (PR-F1 over fix vs regression counts).
+
+    Definitions:
+      N_target = F2P_required + N2P_required
+      N_fixed = F2P_achieved + N2P_achieved
+      N_broken = P2P_failed + P2P_missing
+
+    Edge handling:
+      - If N_target == 0 and N_fixed == 0: Recall = 1
+      - Precision uses epsilon smoothing with ε=1:
+          Precision = (N_fixed + 1) / (N_fixed + N_broken + 1)
+      - If Precision == Recall == 0: score = 0
+
+    Returns None if result is invalid, 0.0 if compilation failure.
+    """
+    if not result:
+        return None
+
+    if check_compilation_failure(result):
+        return 0.0
+
+    ts = result.get("test_summary", {})
+
+    f2p_achieved = ts.get("fail_to_pass_achieved", 0)
+    f2p_required = ts.get("fail_to_pass_required", 0)
+    n2p_achieved = ts.get("none_to_pass_achieved", 0)
+    n2p_required = ts.get("none_to_pass_required", 0)
+    p2p_failed = ts.get("pass_to_pass_failed", 0)
+    p2p_missing = ts.get("pass_to_pass_missing", 0)
+
+    n_target = f2p_required + n2p_required
+    n_fixed = f2p_achieved + n2p_achieved
+    n_broken = p2p_failed + p2p_missing
+
+    if n_target == 0:
+        recall = 1.0 if n_fixed == 0 else 0.0
+    else:
+        recall = n_fixed / n_target
+
+    # epsilon smoothing on precision to avoid overly hard 0 when N_fixed == 0
+    epsilon = 1.0
+    precision = (n_fixed + epsilon) / (n_fixed + n_broken + epsilon)
+
+    if precision == 0 and recall == 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
+def calculate_precision_recall(result: Dict) -> Tuple[Optional[float], Optional[float]]:
+    """Calculate precision and recall components of score_reliable.
+
+    Returns (precision, recall) tuple, or (None, None) if result is invalid.
+    """
+    if not result:
+        return None, None
+
+    if check_compilation_failure(result):
+        return 0.0, 0.0
+
+    ts = result.get("test_summary", {})
+
+    f2p_achieved = ts.get("fail_to_pass_achieved", 0)
+    f2p_required = ts.get("fail_to_pass_required", 0)
+    n2p_achieved = ts.get("none_to_pass_achieved", 0)
+    n2p_required = ts.get("none_to_pass_required", 0)
+    p2p_failed = ts.get("pass_to_pass_failed", 0)
+    p2p_missing = ts.get("pass_to_pass_missing", 0)
+
+    n_target = f2p_required + n2p_required
+    n_fixed = f2p_achieved + n2p_achieved
+    n_broken = p2p_failed + p2p_missing
+
+    if n_target == 0:
+        recall = 1.0 if n_fixed == 0 else 0.0
+    else:
+        recall = n_fixed / n_target
+
+    epsilon = 1.0
+    precision = (n_fixed + epsilon) / (n_fixed + n_broken + epsilon)
+
+    return precision, recall
+
+
 def format_score(score: Optional[float]) -> str:
     """Format score as percentage for display."""
     if score is None:
@@ -1151,6 +1674,7 @@ def print_comparison_table(
     notes = {}
     scores = {}
     scores_v2 = {}
+    scores_reliable = {}
     resolved_count = 0
     graded_count = 0  # Count of milestones that are graded (not in non_graded_milestones)
     sum_cost = 0.0
@@ -1158,6 +1682,7 @@ def print_comparison_table(
     sum_turns = 0  # Total turns
     sum_score = 0.0
     sum_score_v2 = 0.0
+    sum_score_reliable = 0.0
     score_count = 0  # Count of milestones with valid scores
     agent_framework = None
     model = None
@@ -1171,6 +1696,7 @@ def print_comparison_table(
         notes[milestone] = get_failure_note(result, milestone)
         scores[milestone] = calculate_score(result)
         scores_v2[milestone] = calculate_score_v2(result)
+        scores_reliable[milestone] = calculate_score_reliable(result)
 
         # Extract agent_framework and model from first available
         if agent_framework is None and data.get("agent_framework"):
@@ -1189,6 +1715,8 @@ def print_comparison_table(
             if scores_v2[milestone] is not None:
                 sum_score_v2 += scores_v2[milestone]
                 score_count += 1
+            if scores_reliable[milestone] is not None:
+                sum_score_reliable += scores_reliable[milestone]
 
         # Cost includes all milestones
         if cost is not None:
@@ -1241,11 +1769,12 @@ def print_comparison_table(
     turns_suffix = f" | Turns: {display_turns}" if display_turns and display_turns > 0 else ""
     avg_score = sum_score / graded_count if graded_count > 0 else 0.0
     avg_score_v2 = sum_score_v2 / graded_count if graded_count > 0 else 0.0
+    avg_score_reliable = sum_score_reliable / graded_count if graded_count > 0 else 0.0
 
     if non_graded_count > 0:
-        summary_text = f"Score-1000: {avg_score_v2 * 100:.2f}% | Score-full: {avg_score * 100:.2f}% | Resolve: {pass_rate:.2f}% ({resolved_count}/{graded_count}, 排除{non_graded_count}个不计分) | Cost: ${display_cost:.2f}{time_suffix}{turns_suffix}"
+        summary_text = f"Score-1000: {avg_score_v2 * 100:.2f}% | Score-full: {avg_score * 100:.2f}% | Score-reliable: {avg_score_reliable * 100:.2f}% | Resolve: {pass_rate:.2f}% ({resolved_count}/{graded_count}, excl. {non_graded_count} non-graded) | Cost: ${display_cost:.2f}{time_suffix}{turns_suffix}"
     else:
-        summary_text = f"Score-1000: {avg_score_v2 * 100:.2f}% | Score-full: {avg_score * 100:.2f}% | Resolve: {pass_rate:.2f}% ({resolved_count}/{graded_count}) | Cost: ${display_cost:.2f}{time_suffix}{turns_suffix}"
+        summary_text = f"Score-1000: {avg_score_v2 * 100:.2f}% | Score-full: {avg_score * 100:.2f}% | Score-reliable: {avg_score_reliable * 100:.2f}% | Resolve: {pass_rate:.2f}% ({resolved_count}/{graded_count}) | Cost: ${display_cost:.2f}{time_suffix}{turns_suffix}"
 
     # Print summary with prominent border
     summary_width = display_width(summary_text) + 4
@@ -1264,18 +1793,19 @@ def print_comparison_table(
     status_width = 15
     score_1000_width = 12  # "Score-1000"
     score_full_width = 12  # "Score-full"
+    score_reliable_width = 16  # "Score-reliable"
     cost_width = 10
     time_width = 10
     turns_width = 6
     # Dynamic note width based on content
-    note_width = max(len("备注") + 2, max(display_width(n) for n in notes.values()) + 2)
+    note_width = max(len("Note") + 2, max(display_width(n) for n in notes.values()) + 2)
 
     # Build table border strings
     def make_border(left: str, mid: str, right: str) -> str:
         parts = [
             f"{left}{'─' * (milestone_width + 2)}{mid}{'─' * (f2p_width + 2)}{mid}",
             f"{'─' * (n2p_width + 2)}{mid}{'─' * (p2p_width + 2)}{mid}",
-            f"{'─' * (status_width + 2)}{mid}{'─' * (score_1000_width + 2)}{mid}{'─' * (score_full_width + 2)}{mid}",
+            f"{'─' * (status_width + 2)}{mid}{'─' * (score_1000_width + 2)}{mid}{'─' * (score_full_width + 2)}{mid}{'─' * (score_reliable_width + 2)}{mid}",
         ]
         if show_cost_column:
             parts.append(f"{'─' * (cost_width + 2)}{mid}")
@@ -1294,17 +1824,18 @@ def print_comparison_table(
     header_f2p = pad_to_width("F2P", f2p_width)
     header_n2p = pad_to_width("N2P", n2p_width)
     header_p2p = pad_to_width("P2P", p2p_width)
-    header_status = pad_to_width("状态", status_width)
+    header_status = pad_to_width("Status", status_width)
     header_score_1000 = pad_to_width("Score-1000", score_1000_width)
     header_score_full = pad_to_width("Score-full", score_full_width)
+    header_score_reliable = pad_to_width("Score-reliable", score_reliable_width)
     header_cost = pad_to_width("Cost", cost_width)
-    header_time = pad_to_width("Duration", time_width)
+    header_time = pad_to_width("Time", time_width)
     header_turns = pad_to_width("Turns", turns_width)
-    header_note = pad_to_width("备注", note_width)
+    header_note = pad_to_width("Note", note_width)
 
     # Build header row based on which columns are shown
     header_parts = [
-        f"│ {header_milestone} │ {header_f2p} │ {header_n2p} │ {header_p2p} │ {header_status} │ {header_score_1000} │ {header_score_full} │"
+        f"│ {header_milestone} │ {header_f2p} │ {header_n2p} │ {header_p2p} │ {header_status} │ {header_score_1000} │ {header_score_full} │ {header_score_reliable} │"
     ]
     if show_cost_column:
         header_parts.append(f" {header_cost} │")
@@ -1333,12 +1864,13 @@ def print_comparison_table(
         p2p_str = format_p2p(result)
         # Use non-graded status if milestone is in non-graded list
         if milestone in non_graded_milestones:
-            status = "🚫 不计分"
+            status = "🚫 Non-graded"
         else:
             status = get_status(result)
         note = notes[milestone]  # Use pre-calculated note
         score_full_str = format_score(scores[milestone])  # Use pre-calculated score (full)
         score_1000_str = format_score(scores_v2[milestone])  # Use pre-calculated score (1000)
+        score_reliable_str = format_score(scores_reliable[milestone])  # Use pre-calculated score (reliable)
         cost_str = format_cost(cost)
         time_str = format_duration(duration)
         turns_str = str(turns) if turns is not None else "-"
@@ -1351,6 +1883,7 @@ def print_comparison_table(
         status_col = pad_to_width(status, status_width)
         score_1000_col = pad_to_width(score_1000_str, score_1000_width)
         score_full_col = pad_to_width(score_full_str, score_full_width)
+        score_reliable_col = pad_to_width(score_reliable_str, score_reliable_width)
         cost_col = pad_to_width(cost_str, cost_width)
         time_col = pad_to_width(time_str, time_width)
         turns_col = pad_to_width(turns_str, turns_width)
@@ -1358,7 +1891,7 @@ def print_comparison_table(
 
         # Build data row based on which columns are shown
         row_parts = [
-            f"│ {milestone_col} │ {f2p_col} │ {n2p_col} │ {p2p_col} │ {status_col} │ {score_1000_col} │ {score_full_col} │"
+            f"│ {milestone_col} │ {f2p_col} │ {n2p_col} │ {p2p_col} │ {status_col} │ {score_1000_col} │ {score_full_col} │ {score_reliable_col} │"
         ]
         if show_cost_column:
             row_parts.append(f" {cost_col} │")
@@ -1375,18 +1908,41 @@ def print_comparison_table(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compare milestone results across multiple trials")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compare mstone or e2e results across trials and print tables. "
+            "Use --multi-repo to aggregate repos (see module docstring)."
+        )
+    )
     parser.add_argument(
         "--workspace-root",
-        required=True,
         type=Path,
         help="Path to workspace root (e.g., DATA/harness_workspace/...)",
     )
     parser.add_argument(
         "--trials",
         nargs="+",
-        required=True,
         help="List of trial names to compare (e.g., complete_run_001 complete_run_002)",
+    )
+    parser.add_argument(
+        "--multi-repo",
+        action="store_true",
+        help="Aggregate results across multiple repos. "
+             "By default reads analysis/extract/config.py; use --config to override.",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to config module (e.g., analysis/extract/config.py or analysis.extract.config). "
+             "Must define DATA_ROOT, WORKSPACE_MAPPING, and E2E_TRIAL_NAMES.",
+    )
+    parser.add_argument(
+        "--config-repos",
+        nargs="*",
+        default=None,
+        help="Subset of repo keys from WORKSPACE_MAPPING to include (default: all). "
+             "E.g., --config-repos dubbo ripgrep navidrome",
     )
     parser.add_argument(
         "--trial-type",
@@ -1415,180 +1971,405 @@ def main():
         type=str,
         help="Custom sort order: comma-separated milestone IDs (e.g., 'M06,M11,M01') or path to file with one ID per line",
     )
+    parser.add_argument(
+        "--merge-best",
+        action="store_true",
+        help="Merge multiple trials by taking the best score per milestone (default: show each trial separately)",
+    )
 
     args = parser.parse_args()
+
+    # Determine whether to prefer filtered results (default is True, --non-filter sets to False)
+    prefer_filtered = not args.non_filter
+
+    # === Multi-repo mode ===
+    if args.multi_repo:
+        if args.config:
+            # Load user-specified config module
+            import importlib.util
+
+            config_path = Path(args.config)
+            if config_path.suffix == ".py" and config_path.exists():
+                # File path: analysis/extract/config.py
+                spec = importlib.util.spec_from_file_location("_user_config", config_path)
+                _cfg = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(_cfg)
+            else:
+                # Module path: analysis.extract.config
+                sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+                _cfg = importlib.import_module(args.config)
+            DATA_ROOT = _cfg.DATA_ROOT
+            WORKSPACE_MAPPING = _cfg.WORKSPACE_MAPPING
+            E2E_TRIAL_NAMES = _cfg.E2E_TRIAL_NAMES
+        else:
+            # Default: analysis/extract/config.py
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+            from analysis.extract.config import DATA_ROOT, WORKSPACE_MAPPING, E2E_TRIAL_NAMES
+
+        repo_keys = args.config_repos if args.config_repos else list(WORKSPACE_MAPPING.keys())
+        trial_list = args.trials if args.trials else E2E_TRIAL_NAMES
+        trial_type = args.trial_type if args.trial_type != "mstone" else "e2e"
+
+        # Validate repo keys
+        valid_repo_keys = []
+        repo_roots = {}
+        for repo_key in repo_keys:
+            if repo_key not in WORKSPACE_MAPPING:
+                print(f"Warning: unknown repo key '{repo_key}', skipping", file=sys.stderr)
+                continue
+            repo_cfg = WORKSPACE_MAPPING[repo_key]
+            ws_root = Path(DATA_ROOT) / repo_cfg["path"]
+            if not ws_root.exists():
+                print(f"Warning: workspace not found for {repo_key}: {ws_root}", file=sys.stderr)
+                continue
+            valid_repo_keys.append(repo_key)
+            repo_roots[repo_key] = ws_root
+
+        # Print one table per trial
+        for ti, trial in enumerate(trial_list):
+            if ti > 0:
+                print()
+            summaries = []
+            for repo_key in valid_repo_keys:
+                repo_cfg = WORKSPACE_MAPPING[repo_key]
+                summary = compute_repo_summary(repo_roots[repo_key], [trial], trial_type, prefer_filtered)
+                summary["repo"] = repo_cfg.get("display_name", repo_key)
+                summaries.append(summary)
+            print_multi_repo_table(summaries, trial)
+
+        sys.exit(0)
+
+    # === Single-repo mode: validate required args ===
+    if not args.workspace_root:
+        parser.error("--workspace-root is required unless --multi-repo is used")
+    if not args.trials:
+        parser.error("--trials is required unless --multi-repo is used")
 
     if not args.workspace_root.exists():
         print(f"Error: Workspace root does not exist: {args.workspace_root}", file=sys.stderr)
         sys.exit(1)
 
-    # Determine whether to prefer filtered results (default is True, --non-filter sets to False)
-    prefer_filtered = not args.non_filter
-
     # Load selected milestones early (needed for e2e to include unrun milestones)
     selected_milestones, milestones_source = load_selected_milestones(args.workspace_root)
 
-    # Choose comparison function based on trial type
-    if args.trial_type == "e2e":
-        # For e2e, pass selected_milestones unless --show-all is specified
-        # This ensures all selected milestones are shown even if not yet evaluated
-        include_selected = selected_milestones if not args.show_all else None
-        best_results, result_type_counts = compare_trials_e2e(
-            args.workspace_root, args.trials, prefer_filtered, include_selected
-        )
-    else:
-        best_results, result_type_counts = compare_trials(args.workspace_root, args.trials, prefer_filtered)
-
-    if not best_results:
-        print("No results found for any milestone.", file=sys.stderr)
-        sys.exit(1)
-
-    # Filter results by selected milestones (unless --show-all is specified)
-    # Note: selected_milestones was already loaded earlier
-    total_milestones = len(best_results)
-    not_selected_count = 0
-
-    if selected_milestones is not None:
-        # Count how many milestones are not in the selected list
-        not_selected_count = sum(1 for k in best_results.keys() if k not in selected_milestones)
-
-        if not args.show_all:
-            # Filter to only show selected milestones
-            # For e2e, we already included selected milestones in compare_trials_e2e
-            # For mstone, we need to filter here
-            best_results = {k: v for k, v in best_results.items() if k in selected_milestones}
-
-    if not best_results:
-        print("No results found for any milestone after filtering.", file=sys.stderr)
-        sys.exit(1)
-
-    # Print result source information
-    print()
-    if prefer_filtered:
-        print("📋 结果来源: 优先使用 evaluation_result_filtered.json (过滤后结果)")
-    else:
-        print("📋 结果来源: 使用 evaluation_result.json (原始结果)")
-
-    filtered_count = result_type_counts.get("filtered", 0)
-    unfiltered_count = result_type_counts.get("unfiltered", 0)
-    synthetic_count = result_type_counts.get("synthetic", 0)
-
-    if filtered_count > 0 or unfiltered_count > 0:
-        source_info = []
-        if filtered_count > 0:
-            source_info.append(f"过滤后: {filtered_count}")
-        if unfiltered_count > 0:
-            source_info.append(f"原始: {unfiltered_count}")
-        if synthetic_count > 0:
-            source_info.append(f"合成: {synthetic_count}")
-        print(f"   加载统计: {', '.join(source_info)}")
-
-    # Print milestone filtering info
-    if selected_milestones is not None:
-        if args.show_all:
-            print(f"📌 显示范围: 全部 milestone ({total_milestones} 个，含 {not_selected_count} 个未选中)")
-        else:
-            print(
-                f"📌 显示范围: 仅 {milestones_source} 中的 milestone ({len(best_results)} 个，隐藏 {not_selected_count} 个)"
-            )
-    else:
-        print(f"📌 显示范围: 全部 milestone (未找到 selected_milestone_ids.txt 或 milestones.csv)")
-    print()
-
-    # Load non-graded milestones
+    # Shared state computed once
+    include_selected = selected_milestones if not args.show_all else None
     non_graded_milestones = load_non_graded_milestones(args.workspace_root)
 
-    # Determine custom sort order
+    # Determine custom sort order (shared across all display modes)
     custom_sort_key = None
     custom_order = None
-
-    # For e2e trials, default to using the first trial's execution order
-    # For mstone trials, check if there's a matching e2e trial with the same name
     sort_by_e2e_trial = args.sort_by_e2e
     if not args.sort_by_e2e and not args.sort_order:
         if args.trial_type == "e2e":
-            # Use the first trial as default for e2e sorting
             sort_by_e2e_trial = args.trials[0]
         else:
-            # For mstone, check if there's a matching e2e trial
             for trial in args.trials:
                 e2e_trial_dir = args.workspace_root / "e2e_trial" / trial
                 if e2e_trial_dir.exists():
                     sort_by_e2e_trial = trial
                     break
-
     if sort_by_e2e_trial:
-        # Load execution order from e2e trial
         custom_order = load_e2e_execution_order(args.workspace_root, sort_by_e2e_trial)
         if custom_order:
-            print(f"📊 排序方式: 按 e2e trial '{sort_by_e2e_trial}' 执行顺序")
-            print(f"   执行顺序: {', '.join(custom_order)}")
             custom_sort_key = make_custom_sort_key(custom_order)
         else:
             print(f"Warning: Could not load execution order from e2e trial '{sort_by_e2e_trial}'", file=sys.stderr)
     elif args.sort_order:
-        # Check if it's a file path or comma-separated list
         sort_order_path = Path(args.sort_order)
         if sort_order_path.exists():
-            # Load from file
             try:
                 with open(sort_order_path) as f:
                     custom_order = [line.strip() for line in f if line.strip()]
-                print(f"📊 排序方式: 按文件 '{args.sort_order}' 中的顺序")
             except Exception as e:
                 print(f"Warning: Failed to load sort order from {args.sort_order}: {e}", file=sys.stderr)
         else:
-            # Parse as comma-separated list
             custom_order = [m.strip() for m in args.sort_order.split(",") if m.strip()]
-            print(f"📊 排序方式: 按指定顺序")
-
         if custom_order:
-            print(f"   排序顺序: {', '.join(custom_order)}")
             custom_sort_key = make_custom_sort_key(custom_order)
 
-    print()
+    # Helper: load results for a list of trials, filter, and print table
+    def _load_filter_and_print(trial_list: list, print_header_info: bool = True):
+        """Load results for given trials, apply filters, and print table."""
+        if args.trial_type == "e2e":
+            best_results, result_type_counts = compare_trials_e2e(
+                args.workspace_root, trial_list, prefer_filtered, include_selected
+            )
+        else:
+            best_results, result_type_counts = compare_trials(args.workspace_root, trial_list, prefer_filtered)
 
-    # For e2e trials, load total cost, duration, turns from trial-level stats
-    if args.trial_type == "e2e":
-        # Load total cost, duration, turns from the first trial (or sum if multiple trials)
-        total_cost = 0.0
-        total_duration = 0
-        total_turns = 0
-        for trial in args.trials:
-            trial_cost = load_e2e_trial_cost(args.workspace_root, trial)
-            if trial_cost is not None:
-                total_cost += trial_cost
-            trial_duration = load_e2e_trial_duration(args.workspace_root, trial)
-            if trial_duration is not None:
-                total_duration += trial_duration
-            trial_turns = load_e2e_trial_turns(args.workspace_root, trial)
-            if trial_turns is not None:
-                total_turns += trial_turns
-        print_comparison_table(
-            best_results,
-            non_graded_milestones,
-            show_cost_column=False,
-            total_cost=total_cost,
-            show_time_column=False,
-            custom_sort_key=custom_sort_key,
-            trial_names=args.trials,
-            workspace_root=args.workspace_root,
-            trial_type=args.trial_type,
-            total_duration=total_duration if total_duration > 0 else None,
-            total_turns=total_turns if total_turns > 0 else None,
+        if not best_results:
+            print("No results found for any milestone.", file=sys.stderr)
+            return
+
+        # Filter by selected milestones
+        if selected_milestones is not None and not args.show_all:
+            best_results = {k: v for k, v in best_results.items() if k in selected_milestones}
+
+        if not best_results:
+            print("No results found for any milestone after filtering.", file=sys.stderr)
+            return
+
+        if print_header_info:
+            # Print result source information
+            print()
+            if prefer_filtered:
+                print("📋 Source: prefer evaluation_result_filtered.json (filtered)")
+            else:
+                print("📋 Source: using evaluation_result.json (unfiltered)")
+
+            filtered_count = result_type_counts.get("filtered", 0)
+            unfiltered_count = result_type_counts.get("unfiltered", 0)
+            synthetic_count = result_type_counts.get("synthetic", 0)
+            if filtered_count > 0 or unfiltered_count > 0:
+                source_info = []
+                if filtered_count > 0:
+                    source_info.append(f"filtered: {filtered_count}")
+                if unfiltered_count > 0:
+                    source_info.append(f"unfiltered: {unfiltered_count}")
+                if synthetic_count > 0:
+                    source_info.append(f"synthetic: {synthetic_count}")
+                print(f"   Load stats: {', '.join(source_info)}")
+
+            non_graded_in_results = len(non_graded_milestones & best_results.keys())
+            non_graded_suffix = f", {non_graded_in_results} non-graded" if non_graded_in_results > 0 else ""
+            if selected_milestones is not None:
+                selected_in_results = sum(1 for k in best_results.keys() if k in selected_milestones)
+                if args.show_all:
+                    total_milestones = len(best_results)
+                    print(
+                        f"📌 Scope: all {total_milestones} milestones, {selected_in_results} selected{non_graded_suffix}"
+                    )
+                else:
+                    print(f"📌 Scope: {len(best_results)} selected milestones{non_graded_suffix}")
+            else:
+                print(f"📌 Scope: all {len(best_results)} milestones{non_graded_suffix}")
+
+            if custom_order and sort_by_e2e_trial:
+                print(f"📊 Sort: by e2e trial '{sort_by_e2e_trial}' execution order")
+                print(f"   Execution order: {', '.join(custom_order)}")
+            elif custom_order and args.sort_order:
+                sort_order_path = Path(args.sort_order)
+                if sort_order_path.exists():
+                    print(f"📊 Sort: by order in file '{args.sort_order}'")
+                else:
+                    print(f"📊 Sort: by specified order")
+                print(f"   Sort order: {', '.join(custom_order)}")
+
+            print()
+
+        # Print table
+        if args.trial_type == "e2e":
+            total_cost = 0.0
+            total_duration = 0
+            total_turns = 0
+            for trial in trial_list:
+                trial_cost = load_e2e_trial_cost(args.workspace_root, trial)
+                if trial_cost is not None:
+                    total_cost += trial_cost
+                trial_duration = load_e2e_trial_duration(args.workspace_root, trial)
+                if trial_duration is not None:
+                    total_duration += trial_duration
+                trial_turns = load_e2e_trial_turns(args.workspace_root, trial)
+                if trial_turns is not None:
+                    total_turns += trial_turns
+            print_comparison_table(
+                best_results,
+                non_graded_milestones,
+                show_cost_column=False,
+                total_cost=total_cost,
+                show_time_column=False,
+                custom_sort_key=custom_sort_key,
+                trial_names=trial_list,
+                workspace_root=args.workspace_root,
+                trial_type=args.trial_type,
+                total_duration=total_duration if total_duration > 0 else None,
+                total_turns=total_turns if total_turns > 0 else None,
+            )
+        else:
+            print_comparison_table(
+                best_results,
+                non_graded_milestones,
+                show_cost_column=True,
+                show_time_column=True,
+                custom_sort_key=custom_sort_key,
+                trial_names=trial_list,
+                workspace_root=args.workspace_root,
+                trial_type=args.trial_type,
+            )
+
+    # Helper: compute summary stats for a single trial (used in comparison table)
+    def _compute_trial_summary(trial: str) -> dict:
+        """Compute summary metrics for a single trial."""
+        if args.trial_type == "e2e":
+            results, _ = compare_trials_e2e(args.workspace_root, [trial], prefer_filtered, include_selected)
+        else:
+            results, _ = compare_trials(args.workspace_root, [trial], prefer_filtered)
+
+        if not results:
+            return {"trial": trial, "error": True}
+
+        # Filter by selected milestones
+        if selected_milestones is not None and not args.show_all:
+            results = {k: v for k, v in results.items() if k in selected_milestones}
+
+        resolved_count = 0
+        graded_count = 0
+        sum_score_1000 = 0.0
+        sum_score_full = 0.0
+        sum_score_reliable = 0.0
+        score_count = 0
+
+        for milestone, data in results.items():
+            result = data["result"]
+            if milestone not in non_graded_milestones:
+                graded_count += 1
+                if is_resolved(result):
+                    resolved_count += 1
+                s1000 = calculate_score_v2(result)
+                sfull = calculate_score(result)
+                srel = calculate_score_reliable(result)
+                if s1000 is not None:
+                    sum_score_1000 += s1000
+                    score_count += 1
+                if sfull is not None:
+                    sum_score_full += sfull
+                if srel is not None:
+                    sum_score_reliable += srel
+
+        cost = load_e2e_trial_cost(args.workspace_root, trial) if args.trial_type == "e2e" else None
+        duration = load_e2e_trial_duration(args.workspace_root, trial) if args.trial_type == "e2e" else None
+        turns = load_e2e_trial_turns(args.workspace_root, trial) if args.trial_type == "e2e" else None
+        total_ms, submitted_ms = (
+            load_e2e_trial_submission_counts(args.workspace_root, trial) if args.trial_type == "e2e" else (0, 0)
         )
+
+        return {
+            "trial": trial,
+            "error": False,
+            "graded": graded_count,
+            "resolved": resolved_count,
+            "resolve_pct": resolved_count * 100 / graded_count if graded_count > 0 else 0.0,
+            "score_1000": sum_score_1000 / graded_count * 100 if graded_count > 0 else 0.0,
+            "score_full": sum_score_full / graded_count * 100 if graded_count > 0 else 0.0,
+            "score_reliable": sum_score_reliable / graded_count * 100 if graded_count > 0 else 0.0,
+            "cost": cost,
+            "duration": duration,
+            "turns": turns,
+            "total_milestones": total_ms,
+            "submitted": submitted_ms,
+        }
+
+    # === Main display logic ===
+    if len(args.trials) > 1 and not args.merge_best:
+        # Separate mode: show each trial independently
+        print()
+        print(f"📊 Mode: separate display ({len(args.trials)} trials)")
+
+        # Print summary comparison table at the top
+        summaries = [_compute_trial_summary(trial) for trial in args.trials]
+
+        # Build comparison table
+        # Pre-compute resolve and submitted strings to determine column widths
+        resolve_strs = {}
+        submitted_strs = {}
+        for s in summaries:
+            if not s["error"]:
+                resolve_strs[s["trial"]] = f"{s['resolve_pct']:.2f}% ({s['resolved']}/{s['graded']})"
+                total_ms = s.get("total_milestones", 0)
+                sub_ms = s.get("submitted", 0)
+                submitted_strs[s["trial"]] = f"{sub_ms}/{total_ms}" if total_ms > 0 else "-"
+            else:
+                resolve_strs[s["trial"]] = "(no data)"
+                submitted_strs[s["trial"]] = "-"
+
+        trial_col_w = max(len("Trial"), max(len(s["trial"]) for s in summaries)) + 2
+        resolve_col_w = max(10, max(len(v) for v in resolve_strs.values()) + 1)
+        submitted_col_w = max(9, max(len(v) for v in submitted_strs.values()) + 1)
+        num_cols = [
+            ("Submitted", submitted_col_w),
+            ("*Resolve*", resolve_col_w),
+            ("*Score-rel*", 12),
+            ("Score-1000", 12),
+            ("Score-full", 12),
+            ("Cost", 10),
+            ("Time", 12),
+            ("Turns", 8),
+        ]
+
+        # Header
+        header = f"│ {'Trial':<{trial_col_w}}"
+        for col_name, col_w in num_cols:
+            header += f"│ {col_name:>{col_w}} "
+        header += "│"
+        sep_top = "┌" + "─" * (trial_col_w + 1)
+        sep_mid = "├" + "─" * (trial_col_w + 1)
+        sep_bot = "└" + "─" * (trial_col_w + 1)
+        for _, col_w in num_cols:
+            sep_top += "┬" + "─" * (col_w + 2)
+            sep_mid += "┼" + "─" * (col_w + 2)
+            sep_bot += "┴" + "─" * (col_w + 2)
+        sep_top += "┐"
+        sep_mid += "┤"
+        sep_bot += "┘"
+
+        print()
+        print("  (* = key metrics)")
+        print(sep_top)
+        print(header)
+        print(sep_mid)
+        for s in summaries:
+            if s["error"]:
+                row = f"│ {s['trial']:<{trial_col_w}}"
+                row += f"│ {submitted_strs[s['trial']]:>{num_cols[0][1]}} "
+                row += f"│ {resolve_strs[s['trial']]:>{num_cols[1][1]}} "
+                for _, col_w in num_cols[2:]:
+                    row += f"│ {'-':>{col_w}} "
+                row += "│"
+            else:
+                cost_str = f"${s['cost']:.2f}" if s["cost"] is not None else "-"
+                dur_str = format_duration(s["duration"]) if s["duration"] else "-"
+                turns_str = str(s["turns"]) if s["turns"] else "-"
+                srel = f"{s['score_reliable']:.2f}%"
+                s1k = f"{s['score_1000']:.2f}%"
+                sfull = f"{s['score_full']:.2f}%"
+                row = f"│ {s['trial']:<{trial_col_w}}"
+                row += f"│ {submitted_strs[s['trial']]:>{num_cols[0][1]}} "
+                row += f"│ {resolve_strs[s['trial']]:>{num_cols[1][1]}} "
+                row += f"│ {srel:>{num_cols[2][1]}} "
+                row += f"│ {s1k:>{num_cols[3][1]}} "
+                row += f"│ {sfull:>{num_cols[4][1]}} "
+                row += f"│ {cost_str:>{num_cols[5][1]}} "
+                row += f"│ {dur_str:>{num_cols[6][1]}} "
+                row += f"│ {turns_str:>{num_cols[7][1]}} "
+                row += "│"
+            print(row)
+        print(sep_bot)
+
+        for i, trial in enumerate(args.trials, 1):
+            print()
+            print("━" * 55)
+            print(f"  Trial {i}/{len(args.trials)}: {trial}")
+            print("━" * 55)
+            # Each trial uses its own execution order
+            if args.trial_type == "e2e" and not args.sort_order:
+                trial_order = load_e2e_execution_order(args.workspace_root, trial)
+                if trial_order:
+                    custom_sort_key = make_custom_sort_key(trial_order)
+                    custom_order = trial_order
+                    sort_by_e2e_trial = trial
+                else:
+                    custom_sort_key = None
+                    custom_order = None
+                    sort_by_e2e_trial = None
+            _load_filter_and_print([trial])
+            print()
     else:
-        # For mstone trials, show time column
-        print_comparison_table(
-            best_results,
-            non_graded_milestones,
-            show_cost_column=True,
-            show_time_column=True,
-            custom_sort_key=custom_sort_key,
-            trial_names=args.trials,
-            workspace_root=args.workspace_root,
-            trial_type=args.trial_type,
-        )
+        # Merged mode (--merge-best) or single trial
+        if len(args.trials) > 1:
+            print()
+            print(f"📊 Mode: merge-best (best score per milestone, {len(args.trials)} trials)")
+        _load_filter_and_print(args.trials)
 
 
 if __name__ == "__main__":

@@ -19,10 +19,14 @@ class ToolCallRecord:
     output_size: int  # Output size in bytes
     milestone_id: Optional[str] = None  # Associated milestone
     is_subagent: bool = False  # Whether from subagent
+    cost_usd: float = 0.0  # Allocated cost for this tool call
+    token_usage: Dict[str, int] = field(default_factory=dict)  # Allocated token usage for this tool call
+    _bash_command: Optional[str] = None  # Internal: raw command for Bash tool calls (not serialized)
+    behavior_detail: Optional[str] = None  # Fine-grained behavior category (14 categories)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to JSON-serializable dictionary."""
-        return {
+        d = {
             "id": self.id,
             "name": self.name,
             "timestamp": self.timestamp.isoformat() + "Z" if self.timestamp else None,
@@ -31,7 +35,12 @@ class ToolCallRecord:
             "output_size": self.output_size,
             "milestone_id": self.milestone_id,
             "is_subagent": self.is_subagent,
+            "cost_usd": self.cost_usd,
+            "token_usage": self.token_usage,
         }
+        if self.behavior_detail is not None:
+            d["behavior_detail"] = self.behavior_detail
+        return d
 
 
 @dataclass
@@ -43,15 +52,46 @@ class SessionInfo:
     end_time: Optional[datetime] = None  # Session end (agent_exec_end or last tool call)
     duration_ms: int = 0  # Active duration (end - start)
     tool_call_count: int = 0  # Number of tool calls in this session
+    session_id: Optional[str] = None  # UUID from session_history.jsonl
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to JSON-serializable dictionary."""
-        return {
+        d = {
             "session_index": self.session_index,
             "start_time": self.start_time.isoformat() + "Z" if self.start_time else None,
             "end_time": self.end_time.isoformat() + "Z" if self.end_time else None,
             "duration_ms": self.duration_ms,
-            "tool_call_count": self.tool_call_count,
+        }
+        if self.tool_call_count:
+            d["tool_call_count"] = self.tool_call_count
+        if self.session_id is not None:
+            d["session_id"] = self.session_id
+        return d
+
+
+@dataclass
+class NativeUsageUnit:
+    """Framework-native finest-grained usage/cost unit (message/turn)."""
+
+    id: str
+    source_type: str  # e.g., "message", "turn"
+    timestamp: Optional[datetime]
+    model: str
+    milestone_id: Optional[str] = None
+    token_usage: Dict[str, int] = field(default_factory=dict)
+    cost_usd: float = 0.0
+    is_subagent: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "source_type": self.source_type,
+            "timestamp": self.timestamp.isoformat() + "Z" if self.timestamp else None,
+            "model": self.model,
+            "milestone_id": self.milestone_id,
+            "token_usage": self.token_usage,
+            "cost_usd": self.cost_usd,
+            "is_subagent": self.is_subagent,
         }
 
 
@@ -105,7 +145,8 @@ class TrialStats:
     total_turns: int = 0
     total_tool_calls: int = 0
     total_subagent_calls: int = 0
-    session_count: int = 0
+    session_count: int = 0  # Execution attempts (used for active-time segmentation)
+    unique_session_count: int = 0  # Unique logical session IDs
     sessions: List[SessionInfo] = field(default_factory=list)  # Detected active sessions
 
     # Agent configuration
@@ -115,7 +156,9 @@ class TrialStats:
     model_usage: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     tool_call_breakdown: Dict[str, int] = field(default_factory=dict)
     milestone_stats: Dict[str, MilestoneStats] = field(default_factory=dict)
+    native_usage_units: List[NativeUsageUnit] = field(default_factory=list)
     all_tool_calls: List[ToolCallRecord] = field(default_factory=list)
+    verification_events: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to JSON-serializable dictionary."""
@@ -141,6 +184,7 @@ class TrialStats:
                     "total_tool_calls": self.total_tool_calls,
                     "total_subagent_calls": self.total_subagent_calls,
                     "session_count": self.session_count,
+                    "unique_session_count": self.unique_session_count,
                     "sessions": [s.to_dict() for s in self.sessions],
                 },
                 "modelUsage": self.model_usage,
@@ -148,7 +192,9 @@ class TrialStats:
                 "milestone_stats": {
                     mid: (ms.to_dict() if hasattr(ms, "to_dict") else ms) for mid, ms in self.milestone_stats.items()
                 },
+                "usage_units": [(u.to_dict() if hasattr(u, "to_dict") else u) for u in self.native_usage_units],
                 "all_tool_calls": [(tc.to_dict() if hasattr(tc, "to_dict") else tc) for tc in self.all_tool_calls],
+                "verification_events": self.verification_events,
             }
         )
 
@@ -232,6 +278,36 @@ class TrialStats:
                     output_size=tc_data.get("output_size", 0),
                     milestone_id=tc_data.get("milestone_id"),
                     is_subagent=tc_data.get("is_subagent", False),
+                    cost_usd=tc_data.get("cost_usd", 0.0),
+                    token_usage=tc_data.get("token_usage", {}),
+                    behavior_detail=tc_data.get("behavior_detail"),
+                )
+            )
+
+        # Parse native usage units
+        native_usage_units = []
+        native_units_data = data.get("usage_units")
+        if not isinstance(native_units_data, list):
+            native_units_data = data.get("framework_native_usage_units")
+        if not isinstance(native_units_data, list):
+            native_units_data = data.get("native_usage_units", [])
+
+        for u_data in native_units_data:
+            u_ts = None
+            if isinstance(u_data, dict) and u_data.get("timestamp"):
+                u_ts = datetime.fromisoformat(u_data["timestamp"].rstrip("Z"))
+            if not isinstance(u_data, dict):
+                continue
+            native_usage_units.append(
+                NativeUsageUnit(
+                    id=u_data.get("id", ""),
+                    source_type=u_data.get("source_type", "turn"),
+                    timestamp=u_ts,
+                    model=u_data.get("model", "unknown"),
+                    milestone_id=u_data.get("milestone_id"),
+                    token_usage=u_data.get("token_usage", {}),
+                    cost_usd=u_data.get("cost_usd", 0.0),
+                    is_subagent=u_data.get("is_subagent", False),
                 )
             )
 
@@ -251,6 +327,7 @@ class TrialStats:
                     end_time=s_end,
                     duration_ms=s_data.get("duration_ms", 0),
                     tool_call_count=s_data.get("tool_call_count", 0),
+                    session_id=s_data.get("session_id"),
                 )
             )
 
@@ -267,12 +344,15 @@ class TrialStats:
             total_tool_calls=summary.get("total_tool_calls", 0),
             total_subagent_calls=summary.get("total_subagent_calls", 0),
             session_count=summary.get("session_count", 0),
+            unique_session_count=summary.get("unique_session_count", summary.get("session_count", 0)),
             sessions=sessions,
             reasoning_effort=data.get("reasoning_effort"),
             model_usage=data.get("modelUsage", {}),
             tool_call_breakdown=data.get("tool_call_breakdown", {}),
             milestone_stats=milestone_stats,
+            native_usage_units=native_usage_units,
             all_tool_calls=all_tool_calls,
+            verification_events=data.get("verification_events", []),
         )
 
     @classmethod

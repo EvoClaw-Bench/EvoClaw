@@ -2,6 +2,9 @@
 
 import logging
 import os
+import re
+import subprocess
+from pathlib import Path
 from typing import List, Optional
 
 from harness.e2e.agents.base import AgentFramework, register_framework
@@ -16,8 +19,9 @@ class CodexFramework(AgentFramework):
     Codex CLI is OpenAI's coding agent that runs in the terminal.
     https://github.com/openai/codex
 
-    This implementation uses API mode with unified environment variables,
-    supporting proxy servers that route to multiple providers.
+    This implementation supports two auth modes:
+    1. API mode (preferred): UNIFIED_API_KEY/UNIFIED_BASE_URL
+    2. OAuth file mode: host ~/.codex/auth.json mounted into container
 
     Environment variables:
         UNIFIED_API_KEY: API key for the unified proxy
@@ -32,11 +36,19 @@ class CodexFramework(AgentFramework):
     # Valid reasoning effort levels
     VALID_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 
+    # Models that need litellm's /openai_passthrough endpoint because
+    # litellm's native /v1/responses reconstructs the SSE stream and drops
+    # events (response.output_item.added, response.content_part.added),
+    # causing Codex CLI to fail with "OutputTextDelta without active item".
+    PASSTHROUGH_MODELS = {"gpt-5.3-codex"}
+
     def __init__(
         self,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
+        include_directories: Optional[List[str]] = None,
+        **kwargs,
     ):
         """Initialize Codex framework.
 
@@ -45,23 +57,68 @@ class CodexFramework(AgentFramework):
             base_url: Base URL for API. If not provided, uses UNIFIED_BASE_URL env var.
             reasoning_effort: Reasoning effort level ("low", "medium", "high").
                              Controls how much the model "thinks" before responding.
-                             Only applicable to reasoning models like gpt-5.2-codex.
+                             Passed to Codex CLI via model_reasoning_effort.
+            include_directories: Extra directories to pass to codex (currently unused,
+                                 accepted for interface compatibility with other frameworks).
         """
         self.api_key = api_key or os.environ.get("UNIFIED_API_KEY")
         self.base_url = base_url or os.environ.get("UNIFIED_BASE_URL")
-        self.reasoning_effort = reasoning_effort
+        self.reasoning_effort = reasoning_effort or "xhigh"
+        self._codex_auth_file = Path.home() / ".codex" / "auth.json"
+        self._codex_config_file = Path.home() / ".codex" / "config.toml"
+
+    def _build_reasoning_effort_args(self) -> List[str]:
+        """Return Codex CLI overrides for reasoning effort.
+
+        Codex CLI reads model reasoning strength from `model_reasoning_effort`.
+        Using `reasoning_effort` here does not reliably override config.toml in
+        the containerized harness environment.
+        """
+        if self.reasoning_effort and self.reasoning_effort in self.VALID_REASONING_EFFORTS:
+            return ["-c", f'model_reasoning_effort="{self.reasoning_effort}"']
+        return []
+
+    def _resolve_model(self, model: str) -> str:
+        """Resolve model name."""
+        return model if model else self.DEFAULT_MODEL
+
+    def _passthrough_base_url(self, model: str) -> str | None:
+        """Return the passthrough base URL if model needs it, else None.
+
+        For models in PASSTHROUGH_MODELS when using a litellm proxy
+        (self.base_url is set), returns the /openai_passthrough/v1 URL
+        that forwards requests directly to OpenAI without modifying
+        the SSE stream.
+        """
+        if self.base_url and model in self.PASSTHROUGH_MODELS:
+            return self.base_url.rstrip("/") + "/openai_passthrough/v1"
+        return None
 
     def get_container_mounts(self) -> List[str]:
         """Return Docker volume mount arguments for Codex.
 
-        For API mode, no credential files need to be mounted.
-        The API key is passed via environment variable.
+        Auth mode priority:
+        1. API key mode when UNIFIED_API_KEY is set
+        2. OAuth file mode when ~/.codex/auth.json exists
 
         Returns:
-            List of -v arguments for docker run (empty for API mode)
+            List of -v arguments for docker run
         """
-        # API mode doesn't need file mounts - key is passed via env var
-        return []
+        if self.api_key:
+            # API mode doesn't need file mounts - key is passed via env var
+            return []
+
+        mounts: List[str] = []
+
+        # Minimal OAuth credential mount.
+        if self._codex_auth_file.exists():
+            mounts.extend(["-v", f"{self._codex_auth_file}:/tmp/host-codex/auth.json:ro"])
+            if self._codex_config_file.exists():
+                mounts.extend(["-v", f"{self._codex_config_file}:/tmp/host-codex/config.toml:ro"])
+        else:
+            logger.warning("No API key and no ~/.codex/auth.json found - Codex authentication may fail")
+
+        return mounts
 
     def get_container_env_vars(self) -> List[str]:
         """Return Docker environment variable arguments.
@@ -86,7 +143,8 @@ class CodexFramework(AgentFramework):
 
         The script:
         1. Installs Codex CLI via npm (if not present)
-        2. Verifies installation
+        2. Copies OAuth credentials from mounted host files (when available)
+        3. Verifies installation
 
         Args:
             agent_name: Git user name for agent commits
@@ -179,6 +237,40 @@ try:
 
 except Exception as e:
     print(f"Error setting up Codex: {e}")
+
+# === Codex: Setup OAuth credentials ===
+try:
+    import os
+    import pwd
+    import shutil
+    from pathlib import Path
+
+    codex_dir = Path('/home/fakeroot/.codex')
+    codex_dir.mkdir(parents=True, exist_ok=True)
+
+    fake_user = pwd.getpwnam('fakeroot')
+    uid, gid = fake_user.pw_uid, fake_user.pw_gid
+    os.chown(codex_dir, uid, gid)
+    os.chmod(codex_dir, 0o700)
+
+    auth_src = Path('/tmp/host-codex/auth.json')
+    auth_dst = codex_dir / 'auth.json'
+    if auth_src.exists():
+        shutil.copy2(auth_src, auth_dst)
+        os.chown(auth_dst, uid, gid)
+        os.chmod(auth_dst, 0o600)
+        print(f"Copied Codex auth file to {auth_dst}")
+
+    config_src = Path('/tmp/host-codex/config.toml')
+    config_dst = codex_dir / 'config.toml'
+    if config_src.exists():
+        shutil.copy2(config_src, config_dst)
+        os.chown(config_dst, uid, gid)
+        os.chmod(config_dst, 0o600)
+        print(f"Copied Codex config file to {config_dst}")
+
+except Exception as e:
+    print(f"Error setting up Codex OAuth files: {e}")
 """
 
     def build_run_command(
@@ -201,7 +293,7 @@ except Exception as e:
         Returns:
             Shell command string
         """
-        actual_model = model if model else self.DEFAULT_MODEL
+        actual_model = self._resolve_model(model)
 
         cmd_parts = [
             "codex",
@@ -212,14 +304,19 @@ except Exception as e:
             "--dangerously-bypass-approvals-and-sandbox",  # Bypass all restrictions
         ]
 
-        # Add reasoning effort if specified
-        if self.reasoning_effort and self.reasoning_effort in self.VALID_REASONING_EFFORTS:
-            cmd_parts.extend(["-c", f'reasoning_effort="{self.reasoning_effort}"'])
+        cmd_parts.extend(self._build_reasoning_effort_args())
 
         # Add prompt from file
         cmd_parts.append(f'"$(cat {prompt_path})"')
 
-        return " ".join(cmd_parts)
+        cmd = " ".join(cmd_parts)
+
+        # For passthrough models, override OPENAI_BASE_URL inline
+        pt_url = self._passthrough_base_url(actual_model)
+        if pt_url:
+            cmd = f"OPENAI_BASE_URL={pt_url} {cmd}"
+
+        return cmd
 
     def build_resume_command(
         self,
@@ -240,7 +337,7 @@ except Exception as e:
         Returns:
             Shell command string
         """
-        actual_model = model if model else self.DEFAULT_MODEL
+        actual_model = self._resolve_model(model)
 
         cmd_parts = [
             "codex",
@@ -253,20 +350,72 @@ except Exception as e:
             "--dangerously-bypass-approvals-and-sandbox",  # Bypass all restrictions
         ]
 
-        # Add reasoning effort if specified
-        if self.reasoning_effort and self.reasoning_effort in self.VALID_REASONING_EFFORTS:
-            cmd_parts.extend(["-c", f'reasoning_effort="{self.reasoning_effort}"'])
+        cmd_parts.extend(self._build_reasoning_effort_args())
 
         # Add message from file
         cmd_parts.append(f'"$(cat {message_path})"')
 
-        return " ".join(cmd_parts)
+        cmd = " ".join(cmd_parts)
+
+        # For passthrough models, override OPENAI_BASE_URL inline
+        pt_url = self._passthrough_base_url(actual_model)
+        if pt_url:
+            cmd = f"OPENAI_BASE_URL={pt_url} {cmd}"
+
+        return cmd
+
+    def extract_session_id_from_container(self, container_name: str) -> Optional[str]:
+        """Extract the latest thread_id from Codex rollout files inside the container.
+
+        Codex stores session files at:
+          ~/.codex/sessions/{year}/{month}/{day}/rollout-{timestamp}-{thread_id}.jsonl
+
+        We find the latest rollout file (by sorted filename) and extract the
+        thread_id from the filename.
+
+        Args:
+            container_name: Name of the Docker container
+
+        Returns:
+            thread_id from the latest rollout file, or None
+        """
+        sessions_dir = "/home/fakeroot/.codex/sessions"
+        try:
+            result = subprocess.run(
+                ["docker", "exec", container_name, "find", sessions_dir, "-name", "*.jsonl", "-type", "f"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                return None
+
+            files = sorted(result.stdout.strip().split("\n"))
+            if not files:
+                return None
+
+            # Latest file is last after sorting (paths contain date components + timestamp)
+            latest_file = files[-1]
+            filename = Path(latest_file).name
+
+            # Filename format: rollout-{timestamp}-{thread_id}.jsonl
+            # timestamp also contains hyphens, so match the UUID at the end
+            match = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$", filename)
+            if match:
+                return match.group(1)
+        except (subprocess.TimeoutExpired, Exception) as e:
+            logger.warning(f"Failed to extract session from Codex container: {e}")
+
+        return None
 
     @staticmethod
     def extract_thread_id(stdout_content: str) -> Optional[str]:
         """Extract thread_id from Codex JSON output.
 
         Codex outputs: {"type":"thread.started","thread_id":"xxx"}
+
+        Returns the LAST thread_id found, since stdout is append-only across
+        resumes and earlier entries may be stale.
 
         Args:
             stdout_content: Content of agent_stdout.txt
@@ -276,6 +425,7 @@ except Exception as e:
         """
         import json
 
+        latest_thread_id = None
         for line in stdout_content.strip().split("\n"):
             if not line:
                 continue
@@ -284,8 +434,8 @@ except Exception as e:
                 if event.get("type") == "thread.started":
                     thread_id = event.get("thread_id")
                     if thread_id:
-                        return thread_id
+                        latest_thread_id = thread_id
             except json.JSONDecodeError:
                 continue
 
-        return None
+        return latest_thread_id

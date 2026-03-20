@@ -27,10 +27,21 @@ class ClaudeCodeFramework(AgentFramework):
 
     FRAMEWORK_NAME = "claude-code"
 
+    # Mapping from harness reasoning effort levels to Claude Code CLI --effort values.
+    # Claude Code accepts: low, medium, high, max
+    # Harness uses: low, medium, high, xhigh
+    EFFORT_MAP = {
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "max",
+    }
+
     def __init__(
         self,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
         **kwargs,
     ):
         """Initialize Claude Code framework.
@@ -38,10 +49,23 @@ class ClaudeCodeFramework(AgentFramework):
         Args:
             api_key: API key. If not provided, uses UNIFIED_API_KEY env var.
             base_url: Base URL. If not provided, uses UNIFIED_BASE_URL env var.
+            reasoning_effort: Reasoning effort level ("low", "medium", "high", "xhigh").
+                             Mapped to Claude Code CLI --effort flag.
+                             "xhigh" is mapped to "max" for Claude Code.
             **kwargs: Additional arguments (ignored for compatibility).
         """
         self._api_key = api_key or os.environ.get("UNIFIED_API_KEY")
         self._base_url = base_url or os.environ.get("UNIFIED_BASE_URL")
+        self._reasoning_effort = reasoning_effort or "high"
+
+    def _build_effort_args(self) -> List[str]:
+        """Return Claude Code CLI args for reasoning effort.
+
+        Maps harness reasoning effort levels to Claude Code --effort values.
+        """
+        if self._reasoning_effort and self._reasoning_effort in self.EFFORT_MAP:
+            return ["--effort", self.EFFORT_MAP[self._reasoning_effort]]
+        return []
 
     def get_container_env_vars(self) -> List[str]:
         """Return Docker environment variable arguments.
@@ -230,9 +254,11 @@ except Exception as e:
             "--dangerously-skip-permissions",
             "--session-id",
             session_id,
-            "<",
-            prompt_path,
         ]
+
+        cmd_parts.extend(self._build_effort_args())
+
+        cmd_parts.extend(["<", prompt_path])
 
         return " ".join(cmd_parts)
 
@@ -261,8 +287,10 @@ except Exception as e:
             "--dangerously-skip-permissions",
             "--resume",
             session_id,
-            "<",
-            message_path,
         ]
+
+        cmd_parts.extend(self._build_effort_args())
+
+        cmd_parts.extend(["<", message_path])
 
         return " ".join(cmd_parts)

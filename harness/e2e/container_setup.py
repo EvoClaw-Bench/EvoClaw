@@ -5,6 +5,7 @@ run_milestone.py (single milestone mode) and orchestrator.py (E2E mode).
 """
 
 import logging
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -13,6 +14,106 @@ from typing import Optional
 from harness.e2e.agents import AgentFramework, get_agent_framework
 
 logger = logging.getLogger("e2e.container_setup")
+
+# Whitelist of domains the agent container is allowed to reach.
+# Based on Codex Cloud "Common dependencies" preset, with all code hosting
+# sites (github.com, gitlab.com, etc.) deliberately removed.
+WHITELISTED_DOMAINS = [
+    # === LLM API endpoints ===
+    "llm-proxy.eval.all-hands.dev",
+    "api.anthropic.com",
+    "statsig.anthropic.com",
+    "sentry.io",
+    "api.openai.com",
+    "generativelanguage.googleapis.com",
+    # === Go module proxy (replaces direct github.com) ===
+    "proxy.golang.org",
+    "sum.golang.org",
+    "storage.googleapis.com",
+    "golang.org",
+    "pkg.go.dev",
+    "goproxy.io",
+    "goproxy.cn",
+    "go.dev",
+    # === npm / yarn ===
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    # === pip ===
+    "pypi.org",
+    "files.pythonhosted.org",
+    # === Rust / cargo ===
+    "crates.io",
+    "static.crates.io",
+    "index.crates.io",
+    "rustup.rs",
+    # === Maven / Java ===
+    "repo1.maven.org",
+    "repo.maven.apache.org",
+    "central.sonatype.com",
+    "spring.io",
+    # === Documentation / Info Sites ===
+    "docs.rs",
+    "docs.spring.io",
+    "javadoc.io",
+    "en.wikipedia.org",
+    "dubbo.apache.org",
+    "docs.python.org",
+    "nodejs.org",
+    "developer.mozilla.org",
+    # === Ruby ===
+    "rubygems.org",
+    # === Debian apt (all containers are Debian-based) ===
+    "deb.debian.org",
+    "security.debian.org",
+    "cdn-fastly.deb.debian.org",
+    "apt.llvm.org",
+    # === Build tools & runtimes ===
+    "nodejs.org",
+    "deb.nodesource.com",
+    "gradle.org",
+    "plugins.gradle.org",
+    "apache.org",
+    "dl.google.com",
+    # === Container registries (tools only, NOT ghcr.io) ===
+    "docker.com",
+    "docker.io",
+    "gcr.io",
+    "mcr.microsoft.com",
+    "quay.io",
+]
+
+# Code hosting domains to poison in /etc/hosts (defense-in-depth).
+CODE_HOSTING_DOMAINS = [
+    "github.com",
+    "www.github.com",
+    "api.github.com",
+    "raw.githubusercontent.com",
+    "gist.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "codeload.github.com",
+    "render.githubusercontent.com",
+    "gitlab.com",
+    "www.gitlab.com",
+    "bitbucket.org",
+    "www.bitbucket.org",
+    "codeberg.org",
+    "sr.ht",
+    "gitea.com",
+    "gitee.com",
+    "sourceforge.net",
+    "ghfast.top",
+    "ghproxy.com",
+    "gitclone.com",
+]
+
+# Well-known CDN CIDR ranges to handle IP rotation during long trials.
+CDN_CIDR_RANGES = [
+    "151.101.0.0/16",  # Fastly
+    "146.75.0.0/16",  # Fastly
+    "104.16.0.0/13",  # Cloudflare
+    "142.250.0.0/15",  # Google
+    "216.239.32.0/19",  # Google
+]
 
 
 class ContainerSetup:
@@ -329,11 +430,16 @@ print("Container initialization complete!")
 
         # Build docker run command
         # Use --init to properly reap zombie child processes (e.g., plugin processes)
+        # --cap-add=NET_ADMIN: required for iptables-based network lockdown
+        # --sysctl net.ipv6.conf.all.disable_ipv6=1: prevent IPv6 bypass of iptables rules
         docker_options = [
             "docker",
             "run",
             "-d",
             "--init",
+            "--cap-add=NET_ADMIN",
+            "--sysctl",
+            "net.ipv6.conf.all.disable_ipv6=1",
             "--name",
             self.container_name,
             "--ulimit",
@@ -611,6 +717,261 @@ echo "Git history truncated successfully"
             logger.warning(f"Git history truncation returned non-zero exit code: {result.returncode}")
         else:
             logger.info("Git history truncation completed")
+
+    def _resolve_whitelisted_ips(self) -> set[str]:
+        """Resolve all WHITELISTED_DOMAINS to IP addresses from the host.
+
+        Performs multiple resolution attempts per domain to capture CDN rotation.
+
+        Returns:
+            Set of unique IP address strings.
+        """
+        ips: set[str] = set()
+        for domain in WHITELISTED_DOMAINS:
+            for _attempt in range(3):
+                try:
+                    results = socket.getaddrinfo(domain, None, socket.AF_INET)
+                    for _family, _type, _proto, _canonname, sockaddr in results:
+                        ips.add(sockaddr[0])
+                except socket.gaierror:
+                    pass  # domain may not resolve — that's fine
+        return ips
+
+    def lock_network(self) -> None:
+        """Apply whitelist-based network lockdown inside the container.
+
+        Must be called AFTER start_container() and truncate_git_history(), but
+        BEFORE handing control to the agent. Runs as root inside the container.
+
+        Steps:
+          1. Install iptables (fatal if fails)
+          2. Resolve WHITELISTED_DOMAINS → IP set (+ CDN CIDRs)
+          3. Build iptables rules: loopback → established → DNS → whitelist → DROP
+          4. Poison /etc/hosts with CODE_HOSTING_DOMAINS
+          5. Set Go env vars (GOPROXY, GONOSUMCHECK, etc.)
+          6. Remove sudoers so fakeroot cannot flush iptables
+          7. Verify lockdown
+
+        Raises:
+            RuntimeError: If iptables installation or rule application fails.
+        """
+        logger.info("Applying network lockdown to container...")
+
+        # --- Step 1: Install iptables ---
+        install_result = subprocess.run(
+            [
+                "docker",
+                "exec",
+                self.container_name,
+                "/bin/sh",
+                "-c",
+                "apt-get update -qq && apt-get install -y -qq iptables",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if install_result.returncode != 0:
+            raise RuntimeError(f"Failed to install iptables in container: {install_result.stderr}")
+        logger.info("  iptables installed")
+
+        # --- Step 2: Resolve whitelisted IPs ---
+        whitelisted_ips = self._resolve_whitelisted_ips()
+        logger.info(f"  Resolved {len(whitelisted_ips)} unique IPs from {len(WHITELISTED_DOMAINS)} domains")
+
+        # --- Step 3: Build iptables script ---
+        # Combine resolved IPs with well-known CDN CIDR ranges
+        accept_lines = []
+        for ip in sorted(whitelisted_ips):
+            accept_lines.append(f"iptables -A OUTPUT -d {ip} -j ACCEPT")
+        for cidr in CDN_CIDR_RANGES:
+            accept_lines.append(f"iptables -A OUTPUT -d {cidr} -j ACCEPT")
+
+        accept_block = "\n".join(accept_lines)
+
+        iptables_script = f"""set -e
+
+# Flush existing rules
+iptables -F OUTPUT
+
+# Allow loopback
+iptables -A OUTPUT -o lo -j ACCEPT
+
+# Allow established/related connections
+iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+# Allow DNS (UDP+TCP port 53) so domain resolution works
+iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
+
+# Allow whitelisted IPs and CDN CIDRs
+{accept_block}
+
+# Default policy: DROP everything else
+iptables -P OUTPUT DROP
+
+echo "iptables rules applied successfully"
+"""
+
+        iptables_result = subprocess.run(
+            ["docker", "exec", self.container_name, "/bin/sh", "-c", iptables_script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if iptables_result.returncode != 0:
+            raise RuntimeError(f"Failed to apply iptables rules: {iptables_result.stderr}")
+        logger.info("  iptables rules applied")
+
+        # --- Step 4: Poison /etc/hosts ---
+        hosts_lines = "\n".join(f"0.0.0.0 {d}" for d in CODE_HOSTING_DOMAINS)
+        hosts_script = f"""
+# Append code-hosting blocks to /etc/hosts
+cat >> /etc/hosts << 'HOSTS_EOF'
+
+# === Network lockdown: code hosting sites blocked ===
+{hosts_lines}
+HOSTS_EOF
+
+# Lock permissions so non-root cannot edit
+chmod 644 /etc/hosts
+echo "/etc/hosts poisoned with {len(CODE_HOSTING_DOMAINS)} domains"
+"""
+        subprocess.run(
+            ["docker", "exec", self.container_name, "/bin/sh", "-c", hosts_script],
+            capture_output=True,
+            text=True,
+        )
+        logger.info(f"  /etc/hosts poisoned ({len(CODE_HOSTING_DOMAINS)} domains)")
+
+        # --- Step 5: Set Go env vars ---
+        go_env_script = """
+# Configure Go to use module proxy instead of direct VCS
+cat >> /etc/environment << 'EOF'
+GOPROXY=https://proxy.golang.org,direct
+GONOSUMCHECK=*
+GONOSUMDB=*
+EOF
+
+# Also set for fakeroot's shell profile
+mkdir -p /home/fakeroot
+cat >> /home/fakeroot/.bashrc << 'EOF'
+export GOPROXY=https://proxy.golang.org,direct
+export GONOSUMCHECK=*
+export GONOSUMDB=*
+EOF
+echo "Go env vars configured"
+"""
+        subprocess.run(
+            ["docker", "exec", self.container_name, "/bin/sh", "-c", go_env_script],
+            capture_output=True,
+            text=True,
+        )
+        logger.info("  Go proxy env vars set")
+
+        # --- Step 6: Remove sudoers to prevent iptables bypass ---
+        sudo_result = subprocess.run(
+            [
+                "docker",
+                "exec",
+                self.container_name,
+                "/bin/sh",
+                "-c",
+                "rm -f /etc/sudoers.d/fakeroot && echo 'sudoers removed'",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        logger.info(f"  {sudo_result.stdout.strip()}")
+
+        # --- Step 7: Verify lockdown ---
+        self.verify_network_lockdown()
+
+        logger.info("Network lockdown applied successfully")
+
+    def verify_network_lockdown(self) -> bool:
+        """Verify that network lockdown is active in the container.
+
+        Tests that a blocked domain (github.com) cannot be reached and that
+        iptables OUTPUT policy is DROP.
+
+        Returns:
+            True if lockdown is verified.
+
+        Raises:
+            RuntimeError: If lockdown verification fails.
+        """
+        # Check iptables OUTPUT policy is DROP
+        policy_result = subprocess.run(
+            [
+                "docker",
+                "exec",
+                self.container_name,
+                "iptables",
+                "-L",
+                "OUTPUT",
+                "-n",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if "policy DROP" not in policy_result.stdout:
+            raise RuntimeError(
+                "Network lockdown verification failed: OUTPUT policy is not DROP. "
+                f"iptables output: {policy_result.stdout}"
+            )
+
+        # Verify a blocked domain is unreachable (as fakeroot, 3s timeout)
+        curl_result = subprocess.run(
+            [
+                "docker",
+                "exec",
+                "--user",
+                "fakeroot",
+                "-e",
+                "HOME=/home/fakeroot",
+                self.container_name,
+                "curl",
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "--connect-timeout",
+                "3",
+                "--max-time",
+                "5",
+                "https://github.com",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if curl_result.returncode == 0 and curl_result.stdout.strip().startswith("2"):
+            raise RuntimeError("Network lockdown verification failed: github.com is reachable")
+
+        # Verify sudo is revoked
+        sudo_result = subprocess.run(
+            [
+                "docker",
+                "exec",
+                "--user",
+                "fakeroot",
+                "-e",
+                "HOME=/home/fakeroot",
+                self.container_name,
+                "sudo",
+                "-n",
+                "true",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if sudo_result.returncode == 0:
+            raise RuntimeError("Network lockdown verification failed: fakeroot still has sudo access")
+
+        logger.info("  Lockdown verified: github.com blocked, sudo revoked, OUTPUT policy DROP")
+        return True
 
     def docker_exec(
         self,
