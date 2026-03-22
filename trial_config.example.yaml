@@ -1,0 +1,45 @@
+# EvoClaw Trial Configuration
+# Copy this file to trial_config.yaml and edit.
+#
+# Usage:
+#   python scripts/run_all.py --config trial_config.yaml
+#
+# Monitor progress:
+#   ./scripts/monitor.sh <trial_name>
+
+# Path to EvoClaw-data (cloned from HuggingFace)
+data_root: /path/to/EvoClaw-data
+
+# Trial name — used as prefix for all trial directories across repos
+trial_name: my_experiment
+
+# Agent framework: claude-code | codex | gemini-cli | openhands
+agent: claude-code
+
+# Model identifier
+model: claude-sonnet-4-5-20250929
+
+# Max agent runtime per repo (seconds)
+timeout: 18000
+
+# Reasoning effort: low | medium | high | xhigh | max
+# Controls the model's thinking depth. Not all agents/models support this.
+# reasoning_effort: high
+
+# Environment variables for model API access:
+#   export UNIFIED_API_KEY=sk-...
+#   export UNIFIED_BASE_URL=https://...    # optional, for proxy or custom endpoints
+
+# ─── Optional ───────────────────────────────────────────
+
+# Run specific repos only (default: all repos found in data_root)
+# Use substring matching — "navidrome" matches "navidrome_navidrome_v0.57.0_v0.58.0"
+# repos:
+#   - navidrome
+#   - ripgrep
+#   - dubbo
+
+# Max number of repos to evaluate in parallel
+# Default: all repos run simultaneously. Uncomment to limit,
+# e.g., if you have limited GPU/memory or API rate limits.
+# max_parallel: 3

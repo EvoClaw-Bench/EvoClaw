@@ -1,7 +1,7 @@
 [project]
-name = "devevol"
+name = "evoclaw"
 version = "0.1.0"
-description = "DevEvol: End-to-End Evaluation Harness for AI Coding Agents on Real-World Software Evolution"
+description = "EvoClaw: End-to-End Evaluation Harness for AI Coding Agents on Real-World Software Evolution"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

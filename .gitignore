@@ -249,3 +249,7 @@ package-lock.json
 # LiteLLM
 litellm_config.yaml
 litellm.log
+
+# EvoClaw trial config (user-specific) and auto-generated collect configs
+trial_config.yaml
+.evoclaw/
