@@ -336,18 +336,29 @@ def format_duration(duration_ms: Optional[int]) -> str:
 def load_e2e_trial_submission_counts(workspace_root: Path, trial: str) -> tuple[int, int]:
     """Load total milestone count and submitted (tagged) count from e2e trial.
 
+    Non-graded milestones are excluded from both counts so that Total/Submit
+    columns are consistent with Eval/Resolve (which already exclude non-graded).
     Retries (e.g. M003.1-retry1) are deduplicated to count unique base milestones.
     Returns (total_milestones, submitted_count). Defaults to (0, 0) if unavailable.
     """
+    non_graded = load_non_graded_milestones(workspace_root)
     summary_path = workspace_root / "e2e_trial" / trial / "evaluation" / "summary.json"
     if not summary_path.exists():
+        # Fall back to selected_milestone_ids.txt for total count
+        selected, _ = load_selected_milestones(workspace_root)
+        if selected is not None:
+            graded = {m for m in selected if m not in non_graded}
+            return len(graded), 0
         return 0, 0
     try:
         with open(summary_path) as f:
             summary = json.load(f)
         total = summary.get("total_milestones", 0)
-        # Deduplicate retries to count unique base milestones
-        base_ids = {_strip_retry_suffix(k) for k in summary.get("results", {})}
+        # Subtract non-graded from total
+        total -= len(non_graded)
+        # Deduplicate retries to count unique base milestones, excluding non-graded
+        base_ids = {_strip_retry_suffix(k) for k in summary.get("results", {})
+                    if _strip_retry_suffix(k) not in non_graded}
         return total, len(base_ids)
     except Exception:
         return 0, 0
@@ -1375,7 +1386,12 @@ def print_multi_repo_table(summaries: List[Dict], trial_label: str = "",
             agent_str = f"\033[36;1m{trial_cfg.get('agent', '?')}\033[0m"
             model_str = f"\033[33;1m{trial_cfg.get('model', '?')}\033[0m"
             effort_str = f"\033[35meffort={effort}\033[0m"
-            print(f"  {agent_str} | {model_str} | {effort_str}")
+            parts = [agent_str, model_str, effort_str]
+            ctx = trial_cfg.get("context_window")
+            if ctx:
+                ctx_label = "1M" if ctx >= 1_000_000 else f"{ctx // 1000}K"
+                parts.append(f"\033[35mcontext={ctx_label}\033[0m")
+            print(f"  {' | '.join(parts)}")
     print()
     print(sep_top)
     print(header)
@@ -1462,17 +1478,28 @@ def _detect_repo_status(workspace_root: Path, trial: str) -> str:
     if not trial_dir.exists():
         return "pending"
 
+    # Check if orchestrator process is alive via lock file
+    orchestrator_alive = False
     lock_file = trial_dir / ".trial.lock"
     if lock_file.exists():
-        # Check if the PID in lock file is alive
         try:
             pid = int(lock_file.read_text().strip())
             subprocess.run(["kill", "-0", str(pid)], check=True, capture_output=True)
-            return "running"
+            orchestrator_alive = True
         except (ValueError, subprocess.CalledProcessError):
             pass
 
-    # Check if docker container is running
+    if orchestrator_alive:
+        return "running"
+
+    # Orchestrator is not alive — check completion before container state,
+    # because containers may be kept running after the trial finishes.
+    eval_dir = trial_dir / "evaluation"
+    if eval_dir.exists() and any(eval_dir.iterdir()):
+        return "done"
+
+    # No evaluation results yet — check if docker container is still running
+    # (could indicate the orchestrator crashed mid-run)
     repo_name = workspace_root.name
     container_name = f"{repo_name}-{trial}"
     try:
@@ -1481,14 +1508,9 @@ def _detect_repo_status(workspace_root: Path, trial: str) -> str:
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode == 0 and "true" in result.stdout.lower():
-            return "running"
+            return "stopped"
     except Exception:
         pass
-
-    # Has evaluation results → done
-    eval_dir = trial_dir / "evaluation"
-    if eval_dir.exists() and any(eval_dir.iterdir()):
-        return "done"
 
     return "stopped"
 
@@ -1514,7 +1536,7 @@ STATUS_ICONS = {
 
 
 def _load_trial_config(repo_roots: Dict[str, Path], trial: str) -> Dict[str, str]:
-    """Load agent/model/effort from trial_metadata.json of the first available repo."""
+    """Load agent/model/effort/context from trial metadata and agent stats."""
     for repo, ws_root in repo_roots.items():
         meta_path = ws_root / "e2e_trial" / trial / "trial_metadata.json"
         if meta_path.exists():
@@ -1534,10 +1556,30 @@ def _load_trial_config(repo_roots: Dict[str, Path], trial: str) -> Dict[str, str
                         "openhands": "high",  # CLI mode default
                     }
                     effort = _effort_defaults.get(agent)
+
+                # Detect context window from agent_stats.json modelUsage
+                context_window = None
+                stats_path = ws_root / "e2e_trial" / trial / "agent_stats.json"
+                if stats_path.exists():
+                    try:
+                        with open(stats_path) as f:
+                            stats = _json.load(f)
+                        model_name = meta.get("model", "")
+                        mu = stats.get("modelUsage", {})
+                        # Check the primary model's contextWindow
+                        if model_name in mu:
+                            context_window = mu[model_name].get("contextWindow")
+                        elif mu:
+                            # Fallback: use the first model entry
+                            context_window = next(iter(mu.values()), {}).get("contextWindow")
+                    except Exception:
+                        pass
+
                 return {
                     "agent": meta.get("agent_name", ""),
                     "model": meta.get("model", ""),
                     "effort": effort,
+                    "context_window": context_window,
                 }
             except Exception:
                 pass
@@ -1578,7 +1620,12 @@ def print_compact_table(
         agent_str = f"\033[36;1m{trial_cfg.get('agent', '?')}\033[0m"
         model_str = f"\033[33;1m{trial_cfg.get('model', '?')}\033[0m"
         effort_str = f"\033[35meffort={effort}\033[0m"
-        config_str = f"\n  {agent_str} | {model_str} | {effort_str}"
+        parts = [agent_str, model_str, effort_str]
+        ctx = trial_cfg.get("context_window")
+        if ctx:
+            ctx_label = "1M" if ctx >= 1_000_000 else f"{ctx // 1000}K"
+            parts.append(f"\033[35mcontext={ctx_label}\033[0m")
+        config_str = f"\n  {' | '.join(parts)}"
 
     # Header
     status_parts = []
@@ -1596,14 +1643,14 @@ def print_compact_table(
 
     # Column widths (total ~78)
     name_w = 14
-    prog_w = 18  # "Total  Impl  Eval"
+    prog_w = 20  # "Total Submit Eval"
     score_w = 7
     resolve_w = 14
     status_w = 14
 
     # Header
     hdr = (
-        f"  {'Repo':<{name_w}} {'Total Subm Eval':>{prog_w}} {'Score':>{score_w}} "
+        f"  {'Repo':<{name_w}} {'Total Submit Eval':>{prog_w}} {'Score':>{score_w}} "
         f"{'Resolve':>{resolve_w}}  {'Status'}"
     )
     print(hdr)
@@ -1629,7 +1676,7 @@ def print_compact_table(
             total_ms = s.get('total_milestones') or s['graded']
             submitted = s.get('submitted', 0)
             evaluated = s['evaluated']
-            prog_str = f"{total_ms:>4}  {submitted:>3}  {evaluated:>3}"
+            prog_str = f"{total_ms:>4}   {submitted:>4}  {evaluated:>3}"
             score_str = f"{s['score_reliable']:.1f}%" if evaluated > 0 else "--"
             resolve_str = f"{s['resolve_pct']:.0f}% ({s['resolved']}/{s['graded']})"
             total_resolved += s['resolved']
@@ -2424,7 +2471,12 @@ def main():
                 agent_str = f"\033[36;1m{trial_cfg.get('agent', '?')}\033[0m"
                 model_str = f"\033[33;1m{trial_cfg.get('model', '?')}\033[0m"
                 effort_str = f"\033[35meffort={effort}\033[0m"
-                print(f"\n\U0001f3c3 {trial_list[0]} | {agent_str} | {model_str} | {effort_str}")
+                parts = [agent_str, model_str, effort_str]
+                ctx = trial_cfg.get("context_window")
+                if ctx:
+                    ctx_label = "1M" if ctx >= 1_000_000 else f"{ctx // 1000}K"
+                    parts.append(f"\033[35mcontext={ctx_label}\033[0m")
+                print(f"\n\U0001f3c3 {trial_list[0]} | {' | '.join(parts)}")
 
             if args.detail == "":
                 # No repo specified: show all repos that have evaluation results

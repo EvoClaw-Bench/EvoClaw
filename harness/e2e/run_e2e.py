@@ -688,14 +688,24 @@ class E2ETrialRunner:
                 # 2. No pending evaluations (pending_futures)
                 # 3. No pending debounce (tags waiting to stabilize)
                 # 4. No running evaluations (important for final milestone in early unlock mode)
+                # 5. No error evaluations that still need re-evaluation
                 with self._state_lock:
                     is_done = (
                         dag.is_done() and not pending_futures and not pending_debounce and not self.running_evaluations
                     )
                 if is_done:
-                    logger.info("All milestones processed and evaluated, watcher exiting")
-                    self.eval_event_queue.put(("watcher_done", None, None, None, None))
-                    break
+                    # Check for error evaluations that need re-evaluation
+                    summary = self.orchestrator._load_summary_or_init()
+                    error_mids = [
+                        mid for mid, r in summary.get("results", {}).items()
+                        if r.get("eval_status") == "error" and mid not in evaluated_hashes
+                    ]
+                    if error_mids:
+                        logger.info(f"DAG done but {len(error_mids)} error evaluation(s) pending re-scan: {error_mids}")
+                    else:
+                        logger.info("All milestones processed and evaluated, watcher exiting")
+                        self.eval_event_queue.put(("watcher_done", None, None, None, None))
+                        break
 
                 # Step 2: Check pending debounce items
                 for mid in list(pending_debounce.keys()):
@@ -799,11 +809,18 @@ class E2ETrialRunner:
                         # Already in debounce, handled above
                         continue
 
-                    # Skip if already completed in DAG (for resume mode without hash)
+                    # Skip if already completed in DAG (for resume mode without hash),
+                    # UNLESS the previous evaluation errored (infrastructure failure) —
+                    # in that case, re-evaluate to get a proper result.
                     if mid in dag.completed_milestones and mid not in evaluated_hashes:
-                        logger.info(f"⏭️  {mid}: Already completed in DAG, skipping evaluation")
-                        evaluated_hashes[mid] = current_hash  # Record hash to prevent re-checking
-                        continue
+                        summary = self.orchestrator._load_summary_or_init()
+                        prev_eval = summary.get("results", {}).get(mid, {}).get("eval_status")
+                        if prev_eval == "error":
+                            logger.info(f"🔄 {mid}: Previously errored (eval_status=error), will re-evaluate")
+                        else:
+                            logger.info(f"⏭️  {mid}: Already completed in DAG, skipping evaluation")
+                            evaluated_hashes[mid] = current_hash  # Record hash to prevent re-checking
+                            continue
 
                     if mid not in evaluated_hashes:
                         # First time seeing this tag, start debounce
@@ -1112,8 +1129,20 @@ class E2ETrialRunner:
                     self.orchestrator._update_task_queue_file(self.orchestrator.trial_root)
                     success = self.agent_runner.send_recover_message(has_new_tasks=True, timeout_ms=recover_timeout_ms)
                     if not success:
+                        # Fatal config error - abort immediately
+                        if self.agent_runner._last_fatal_error:
+                            trial_path = self.orchestrator.trial_root
+                            logger.error(
+                                "⛔ Fatal error: %s\n"
+                                "   Fix the model/config, then resume:\n"
+                                "     python -m harness.e2e.run_e2e --resume-trial %s",
+                                self.agent_runner._last_fatal_error,
+                                trial_path,
+                            )
+                            _set_last_run_summary("fatal_error")
+                            return False
                         # Check if DAG completed while agent was running - no need to fallback
-                        if dag.is_done():
+                        elif dag.is_done():
                             logger.info("Resume failed but DAG is complete - skipping fallback")
                         elif self.agent_runner._last_model_unavailable:
                             hint = self.agent_runner._last_model_hint or (
@@ -1174,6 +1203,22 @@ class E2ETrialRunner:
                 )
 
             if not success:
+                # Check for fatal configuration errors - no point retrying
+                if self.agent_runner._last_fatal_error:
+                    trial_path = self.orchestrator.trial_root
+                    logger.error(
+                        "⛔ Fatal error: %s\n"
+                        "   Fix the model/config and resume with:\n"
+                        "     python -m harness.e2e.run_e2e --resume-trial %s [--model <model>]",
+                        self.agent_runner._last_fatal_error,
+                        trial_path,
+                    )
+                    orchestrator_logger.error(
+                        "⛔ Fatal error: %s. Aborting trial.", self.agent_runner._last_fatal_error
+                    )
+                    _set_last_run_summary("fatal_error")
+                    return False
+
                 # Check if DAG is already complete - no need to retry/recover
                 if dag.is_done():
                     logger.info("Agent failed but DAG is complete - no recovery needed")
@@ -1286,6 +1331,36 @@ class E2ETrialRunner:
                 logger.warning("Timeout waiting for evaluations, attempting recovery...")
                 has_new_tasks = False
                 recover_count += 1
+
+        # Before stopping watcher, check if there are error evaluations to retry.
+        # When DAG is done but some milestones have eval_status=error (infrastructure
+        # failure), the watcher should re-evaluate them before we declare completion.
+        if dag.is_done():
+            summary = self.orchestrator._load_summary_or_init()
+            error_milestones = [
+                mid for mid, r in summary.get("results", {}).items()
+                if r.get("eval_status") == "error"
+            ]
+            if error_milestones:
+                logger.info(f"DAG complete but {len(error_milestones)} milestone(s) have eval errors, "
+                            f"waiting for re-evaluation: {error_milestones}")
+                # Wait for watcher to re-evaluate error milestones.
+                # Poll summary.json until errors are resolved or timeout.
+                reeval_timeout = 600  # 10 minutes max
+                reeval_start = time.time()
+                while time.time() - reeval_start < reeval_timeout:
+                    summary = self.orchestrator._load_summary_or_init()
+                    remaining_errors = [
+                        mid for mid in error_milestones
+                        if summary.get("results", {}).get(mid, {}).get("eval_status") == "error"
+                    ]
+                    if not remaining_errors:
+                        logger.info("All error evaluations resolved!")
+                        break
+                    time.sleep(5)
+                else:
+                    logger.warning(f"Timed out waiting for error re-evaluations after {reeval_timeout}s. "
+                                   f"Remaining: {remaining_errors}")
 
         # Stop watcher
         self.watcher_stop_event.set()
@@ -1618,8 +1693,12 @@ def _run_resume_mode(args):
             logger.error(f"  - {issue}")
         sys.exit(1)
 
-    # Extract config from original metadata
+    # Extract config from original metadata, allow CLI overrides
     metadata = trial_state.original_config
+    # --model override for resume (e.g., fix a wrong model after fatal error)
+    if getattr(args, '_model_explicitly_set', False):
+        logger.info(f"Overriding model: {metadata.get('model')} → {args.model}")
+        metadata["model"] = args.model
     workspace_root = Path(metadata["workspace_root"]).resolve()
 
     # Load workspace metadata (needed for orchestrator)
@@ -1802,6 +1881,9 @@ Example:
     )
 
     args = parser.parse_args()
+
+    # Track whether --model was explicitly provided (vs default)
+    args._model_explicitly_set = '--model' in sys.argv
 
     # Handle resume mode
     if args.resume_trial:

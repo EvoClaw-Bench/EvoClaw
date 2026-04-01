@@ -94,6 +94,7 @@ class AgentRunner:
         self._last_model_unavailable = False
         self._last_model_hint: Optional[str] = None  # Human-readable remediation hint
         self._last_invalid_session = False  # Set when resume session ID is invalid
+        self._last_fatal_error: Optional[str] = None  # Set on fatal config errors (no retry)
 
     # Auth error patterns from agent CLI/API responses
     _AUTH_ERROR_PATTERNS = [
@@ -127,6 +128,15 @@ class AgentRunner:
         "use --list-sessions to see available sessions",
     ]
 
+    # Fatal errors that should cause immediate trial termination (no retry).
+    # These indicate model/context configuration issues that cannot be resolved by retrying.
+    _FATAL_ERROR_PATTERNS = [
+        "extra usage is required for 1m context",
+        "long context beta is not yet available",
+        "it may not exist or you may not have access to it",
+        "string should have at least 1 character",  # empty model name
+    ]
+
     # Known model aliases with recurring 500 patterns in some environments.
     _GEMINI_MODEL_HINTS = {
         "gemini-3-flash": (
@@ -135,6 +145,17 @@ class AgentRunner:
             "try '--model gemini-3-flash-preview' or '--model gemini-2.5-flash'."
         ),
     }
+
+    def _detect_fatal_error(self, output: str) -> Optional[str]:
+        """Check if output contains a fatal configuration error that should stop the trial.
+
+        Returns the matched pattern string if fatal, None otherwise.
+        """
+        output_lower = output.lower()
+        for pattern in self._FATAL_ERROR_PATTERNS:
+            if pattern in output_lower:
+                return pattern
+        return None
 
     def _detect_auth_error(self, output: str) -> bool:
         """Check if agent output contains authentication error indicators."""
@@ -196,6 +217,11 @@ class AgentRunner:
 
     def _classify_failure_signals(self, output: str, context: str) -> None:
         """Classify common failure signals and emit actionable hints."""
+        fatal = self._detect_fatal_error(output)
+        self._last_fatal_error = fatal
+        if fatal:
+            self.logger.error("⛔ Fatal configuration error detected in %s output: %s", context, fatal)
+
         self._last_auth_error = self._detect_auth_error(output)
         if self._last_auth_error:
             self.logger.warning("🔑 Authentication error detected in %s output", context)
@@ -594,6 +620,7 @@ class AgentRunner:
             self._last_model_unavailable = False
             self._last_model_hint = None
             self._last_invalid_session = False
+            self._last_fatal_error = None
             self._append_session_history({"event": "agent_exec_end", "session_id": self.session_id, "success": False})
             self._run_command(["docker", "exec", self.container_name, "rm", "-f", container_prompt_path], check=False)
             return False, self.session_id
@@ -768,6 +795,7 @@ class AgentRunner:
         self._last_model_unavailable = False
         self._last_model_hint = None
         self._last_invalid_session = False
+        self._last_fatal_error = None
         self.logger.info("Agent execution completed successfully")
         return True
 
@@ -792,6 +820,7 @@ class AgentRunner:
         self._last_model_unavailable = False
         self._last_model_hint = None
         self._last_invalid_session = False
+        self._last_fatal_error = None
 
         # Write message to temp file
         if self.log_dir:
@@ -898,6 +927,7 @@ class AgentRunner:
             self._last_model_unavailable = False
             self._last_model_hint = None
             self._last_invalid_session = False
+            self._last_fatal_error = None
             self._append_session_history({"event": "agent_exec_end", "session_id": session_id, "success": False})
             self._run_command(["docker", "exec", self.container_name, "rm", "-f", container_message_path], check=False)
             self._append_session_history(
@@ -917,6 +947,7 @@ class AgentRunner:
             self._last_model_unavailable = False
             self._last_model_hint = None
             self._last_invalid_session = False
+            self._last_fatal_error = None
             self._append_session_history({"event": "agent_exec_end", "session_id": session_id, "success": False})
             self._append_session_history({"event": "resume_failure", "session_id": session_id, "reason": str(e)})
             return False

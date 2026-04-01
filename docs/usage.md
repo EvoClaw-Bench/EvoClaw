@@ -116,9 +116,10 @@ Resume options:
 |------|-------------|
 | `--resume-trial PATH` | Resume from existing trial directory (container must exist) |
 | `--no-resume-session` | In resume mode, start a new agent session instead of resuming the previous one |
+| `--model MODEL` | Override the model from the original trial (e.g., to fix a model config error) |
 | `--force` | Force remove existing container before starting a fresh trial |
 
-> **Tip:** Use `./scripts/monitor.sh` to watch trial progress. If a repo's milestones appear stuck for a long time (usually due to agent framework memory or network issues), kill that repo's `run_e2e` process and resume it with the command above. EvoClaw will automatically continue from the latest checkpoint.
+> **Tip:** Use `./scripts/monitor.sh` to watch trial progress. If a repo's milestones appear stuck for a long time (usually due to agent framework memory or network issues), kill that repo's `run_e2e` process and resume it with the command above. EvoClaw will automatically continue from the latest checkpoint. Milestones with evaluation infrastructure errors (e.g., Docker image issues) are automatically re-evaluated on resume.
 
 ## Run a Single Milestone
 
@@ -151,19 +152,20 @@ Shows all repos at a glance with progress, score, and running status. Fits in 80
 Example output:
 ```
 🏃 my_experiment_001 | 2 running, 5 pending
-  claude-code | claude-sonnet-4-6 | effort=high
+  claude-code | claude-sonnet-4-6 | effort=high | context=200K
 
-  Repo              Total Subm Eval   Score        Resolve  Status
+  Repo              Total Submit Eval   Score        Resolve  Status
   ──────────────────────────────────────────────────────────────────────────
-  ripgrep              13    6    5   19.1%      9% (1/11)  ● running
-  navidrome             9    2    2   11.1%     11% (1/9)   ● running
-  dubbo                12    0    0      --      0% (0/12)  ○ pending
+  ripgrep              11      6    5   19.1%      9% (1/11)  ● running
+  navidrome             9      2    2   11.1%     11% (1/9)   ● running
+  dubbo                12      0    0      --      0% (0/12)  ○ pending
   ...
 ```
 
-- **Total**: total milestones (including non-graded)
-- **Subm**: milestones submitted by the agent (tagged)
+- **Total**: graded milestones (non-graded milestones are excluded)
+- **Submit**: milestones submitted by the agent (tagged)
 - **Eval**: milestones evaluated (scored)
+- **context**: model context window (shown after agent stats are available)
 
 ### Per-Milestone Detail
 
@@ -209,7 +211,7 @@ python -m harness.e2e.evaluator \
 
 ## Configuration
 
-The `e2e_config.yaml` (at `harness/e2e/e2e_config.yaml`) controls evaluation behavior:
+The `e2e_config.yaml` (at `harness/e2e/e2e_config.yaml`) controls evaluation behavior. The default configuration is tuned for the EvoClaw Benchmark:
 
 ```yaml
 dag_unlock:
@@ -230,10 +232,10 @@ See the full [e2e_config.yaml](../harness/e2e/e2e_config.yaml) for all available
 
 ## Trial Output Structure
 
-Each trial produces a structured output directory:
+Trial results are stored under each repo's workspace directory (`{data_root}/{repo_name}/e2e_trial/{trial_name}/`). Each trial produces:
 
 ```
-{workspace_root}/e2e_trial/{trial_name}/
+{data_root}/{repo_name}/e2e_trial/{trial_name}/
 ├── trial_metadata.json        # Run configuration
 ├── orchestrator.log           # Detailed orchestration log
 ├── agent_stats.json           # Agent statistics (cost, tokens, turns)

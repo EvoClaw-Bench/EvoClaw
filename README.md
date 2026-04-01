@@ -121,7 +121,7 @@ python scripts/run_all.py --config trial_config.yaml
 ./scripts/monitor.sh my_experiment --full          # full table with all columns
 ```
 
-> **Tip:** If a repo's milestones appear stuck (usually due to agent framework memory or network issues), kill that repo's `run_e2e` process and resume with `python -m harness.e2e.run_e2e --resume-trial /path/to/trial_dir`. EvoClaw will continue from the latest checkpoint. Use `--force` to start a completely fresh trial.
+> **Tip:** If a repo's milestones appear stuck (usually due to agent framework memory or network issues), kill that repo's `run_e2e` process and resume with `python -m harness.e2e.run_e2e --resume-trial /path/to/trial_dir`. EvoClaw will continue from the latest checkpoint. Use `--model` to override the model on resume, or `--force` to start a completely fresh trial.
 
 > See [docs/usage.md](docs/usage.md) for single-repo runs, resume, re-evaluation, result collection, and all CLI arguments.
 
