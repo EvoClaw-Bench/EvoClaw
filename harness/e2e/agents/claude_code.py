@@ -58,6 +58,10 @@ class ClaudeCodeFramework(AgentFramework):
         self._base_url = base_url or os.environ.get("UNIFIED_BASE_URL")
         self._reasoning_effort = reasoning_effort or "high"
 
+    def get_effective_reasoning_effort(self) -> Optional[str]:
+        """Return effective reasoning effort (default: high)."""
+        return self._reasoning_effort
+
     def _build_effort_args(self) -> List[str]:
         """Return Claude Code CLI args for reasoning effort.
 
@@ -107,10 +111,8 @@ class ClaudeCodeFramework(AgentFramework):
         if claude_share.exists():
             mounts.extend(["-v", f"{claude_share}:/tmp/host-claude-share:ro"])
 
-        # Claude binary
-        claude_bin = home / ".local/bin/claude"
-        if claude_bin.exists():
-            mounts.extend(["-v", f"{claude_bin}:/usr/local/bin/claude:ro"])
+        # Note: Claude binary is installed inside the container via the init script
+        # using the standalone installer (no Node.js dependency).
 
         # extract_claude_logs.py for claude-extract tool
         extract_script = self._find_extract_script()
@@ -152,6 +154,61 @@ class ClaudeCodeFramework(AgentFramework):
             Python script as a string
         """
         return f'''
+# === Claude Code: Install standalone binary ===
+try:
+    import subprocess
+    import shutil
+
+    def run_cmd(cmd, shell=False):
+        try:
+            result = subprocess.run(
+                cmd, shell=shell, capture_output=True, text=True, timeout=300
+            )
+            return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
+        except Exception as e:
+            return False, '', str(e)
+
+    # Check if claude is already installed and working
+    success, version, _ = run_cmd(['claude', '--version'])
+    if success:
+        print(f"Claude Code already installed: {{version}}")
+    else:
+        print("Installing Claude Code standalone binary...")
+
+        # Ensure curl is available
+        if not shutil.which('curl'):
+            print("Installing curl...")
+            run_cmd(['apt-get', 'update'])
+            run_cmd(['apt-get', 'install', '-y', 'curl', 'ca-certificates'])
+
+        # Install via standalone installer (no Node.js required)
+        success, stdout, stderr = run_cmd(
+            'curl -fsSL https://claude.ai/install.sh | bash',
+            shell=True
+        )
+        if success:
+            import os
+
+            # Resolve the actual binary path (installer creates symlink chains under /root/)
+            claude_link = '/root/.local/bin/claude'
+            claude_real = os.path.realpath(claude_link)
+            print(f"Claude Code installed at: {{claude_real}}")
+
+            # Copy the actual binary to /usr/local/bin/ so fakeroot user can access it
+            # (fakeroot cannot traverse /root/ directory)
+            shutil.copy2(claude_real, '/usr/local/bin/claude')
+            os.chmod('/usr/local/bin/claude', 0o755)
+            print("Copied claude binary to /usr/local/bin/claude")
+
+            success, version, _ = run_cmd(['/usr/local/bin/claude', '--version'])
+            print(f"Claude Code ready: {{version}}")
+        else:
+            print(f"Failed to install Claude Code: {{stderr}}")
+            raise Exception("Claude Code installation failed")
+
+except Exception as e:
+    print(f"Error installing Claude Code: {{e}}")
+
 # === Claude Code: Setup Claude directories ===
 try:
     import os

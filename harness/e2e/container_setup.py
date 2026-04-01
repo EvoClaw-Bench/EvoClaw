@@ -23,6 +23,7 @@ WHITELISTED_DOMAINS = [
     "llm-proxy.eval.all-hands.dev",
     "api.anthropic.com",
     "statsig.anthropic.com",
+    "claude.ai",
     "sentry.io",
     "api.openai.com",
     "generativelanguage.googleapis.com",

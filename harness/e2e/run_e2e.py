@@ -1902,6 +1902,14 @@ Example:
 
     # Save trial metadata (including model info)
     from datetime import datetime
+    from harness.e2e.agents import get_agent_framework
+
+    # Resolve the effective reasoning effort from the agent framework
+    _framework_kwargs = {}
+    if args.reasoning_effort:
+        _framework_kwargs["reasoning_effort"] = args.reasoning_effort
+    _tmp_framework = get_agent_framework(args.agent, **_framework_kwargs)
+    effective_reasoning_effort = _tmp_framework.get_effective_reasoning_effort()
 
     trial_metadata = {
         "trial_name": trial_name,
@@ -1912,7 +1920,7 @@ Example:
         "agent_name": args.agent,
         "prompt_version": args.prompt_version,
         "timeout_seconds": args.timeout,
-        "reasoning_effort": args.reasoning_effort,
+        "reasoning_effort": effective_reasoning_effort,
         "repo_src_dirs": repo_src_dirs,
         "test_dirs": test_dirs,
         "exclude_patterns": exclude_patterns,

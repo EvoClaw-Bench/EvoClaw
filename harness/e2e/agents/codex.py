@@ -67,6 +67,10 @@ class CodexFramework(AgentFramework):
         self._codex_auth_file = Path.home() / ".codex" / "auth.json"
         self._codex_config_file = Path.home() / ".codex" / "config.toml"
 
+    def get_effective_reasoning_effort(self) -> Optional[str]:
+        """Return effective reasoning effort (default: xhigh)."""
+        return self.reasoning_effort
+
     def _build_reasoning_effort_args(self) -> List[str]:
         """Return Codex CLI overrides for reasoning effort.
 

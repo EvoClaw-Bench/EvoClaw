@@ -1300,7 +1300,8 @@ def compute_repo_summary(
     }
 
 
-def print_multi_repo_table(summaries: List[Dict], trial_label: str = ""):
+def print_multi_repo_table(summaries: List[Dict], trial_label: str = "",
+                           repo_roots: Optional[Dict[str, Path]] = None):
     """Print a summary table aggregating results across multiple repos."""
     if not summaries:
         print("No results to display.")
@@ -1367,6 +1368,14 @@ def print_multi_repo_table(summaries: List[Dict], trial_label: str = ""):
 
     if trial_label:
         print(f"\n\U0001f3c3 Trial: {trial_label}")
+        # Show agent/model/effort config
+        trial_cfg = _load_trial_config(repo_roots, trial_label) if repo_roots else {}
+        if trial_cfg:
+            effort = trial_cfg.get("effort") or "n/a"
+            agent_str = f"\033[36;1m{trial_cfg.get('agent', '?')}\033[0m"
+            model_str = f"\033[33;1m{trial_cfg.get('model', '?')}\033[0m"
+            effort_str = f"\033[35meffort={effort}\033[0m"
+            print(f"  {agent_str} | {model_str} | {effort_str}")
     print()
     print(sep_top)
     print(header)
@@ -1443,6 +1452,368 @@ def print_multi_repo_table(summaries: List[Dict], trial_label: str = ""):
         print(_build_row_right("AVERAGE", avg_vals))
 
     print(sep_bot)
+
+
+def _detect_repo_status(workspace_root: Path, trial: str) -> str:
+    """Detect repo status by checking trial directory, lock file, and docker container."""
+    import subprocess
+
+    trial_dir = workspace_root / "e2e_trial" / trial
+    if not trial_dir.exists():
+        return "pending"
+
+    lock_file = trial_dir / ".trial.lock"
+    if lock_file.exists():
+        # Check if the PID in lock file is alive
+        try:
+            pid = int(lock_file.read_text().strip())
+            subprocess.run(["kill", "-0", str(pid)], check=True, capture_output=True)
+            return "running"
+        except (ValueError, subprocess.CalledProcessError):
+            pass
+
+    # Check if docker container is running
+    repo_name = workspace_root.name
+    container_name = f"{repo_name}-{trial}"
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Running}}", container_name],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and "true" in result.stdout.lower():
+            return "running"
+    except Exception:
+        pass
+
+    # Has evaluation results → done
+    eval_dir = trial_dir / "evaluation"
+    if eval_dir.exists() and any(eval_dir.iterdir()):
+        return "done"
+
+    return "stopped"
+
+
+def _short_repo_name(repo: str) -> str:
+    """Shorten repo name: 'BurntSushi_ripgrep_14.1.1_15.0.0' → 'ripgrep'.
+
+    Format is '{owner}_{project}_{start_ver}_{end_ver}'.
+    Returns the project name (second segment).
+    """
+    parts = repo.split("_")
+    if len(parts) >= 2:
+        return parts[1]
+    return parts[0]
+
+
+STATUS_ICONS = {
+    "running": "\033[32m●\033[0m running",
+    "done": "\033[34m✓\033[0m done",
+    "stopped": "\033[33m■\033[0m stopped",
+    "pending": "\033[90m○\033[0m pending",
+}
+
+
+def _load_trial_config(repo_roots: Dict[str, Path], trial: str) -> Dict[str, str]:
+    """Load agent/model/effort from trial_metadata.json of the first available repo."""
+    for repo, ws_root in repo_roots.items():
+        meta_path = ws_root / "e2e_trial" / trial / "trial_metadata.json"
+        if meta_path.exists():
+            try:
+                import json as _json
+                with open(meta_path) as f:
+                    meta = _json.load(f)
+                # Resolve effective reasoning effort:
+                # New metadata has the resolved value; old metadata may have null
+                effort = meta.get("reasoning_effort")
+                if effort is None:
+                    # Fallback for old metadata that stored null instead of effective value
+                    agent = meta.get("agent_name", "")
+                    _effort_defaults = {
+                        "claude-code": "high",
+                        "codex": "xhigh",
+                        "openhands": "high",  # CLI mode default
+                    }
+                    effort = _effort_defaults.get(agent)
+                return {
+                    "agent": meta.get("agent_name", ""),
+                    "model": meta.get("model", ""),
+                    "effort": effort,
+                }
+            except Exception:
+                pass
+    return {}
+
+
+def print_compact_table(
+    summaries: List[Dict],
+    trial_label: str = "",
+    repo_roots: Optional[Dict[str, Path]] = None,
+    trial: str = "",
+):
+    """Print a compact summary table that fits in 80 columns."""
+    if not summaries:
+        print("No results to display.")
+        return
+
+    # Detect status for each repo
+    statuses = {}
+    for s in summaries:
+        repo = s["repo"]
+        if repo_roots and repo in repo_roots and trial:
+            statuses[repo] = _detect_repo_status(repo_roots[repo], trial)
+        else:
+            statuses[repo] = "pending" if s.get("error") else "done"
+
+    n_running = sum(1 for v in statuses.values() if v == "running")
+    n_done = sum(1 for v in statuses.values() if v == "done")
+    n_pending = sum(1 for v in statuses.values() if v == "pending")
+    n_stopped = sum(1 for v in statuses.values() if v == "stopped")
+
+    # Trial config line
+    trial_cfg = _load_trial_config(repo_roots, trial) if repo_roots else {}
+    config_str = ""
+    if trial_cfg:
+        effort = trial_cfg.get("effort") or "n/a"
+
+        agent_str = f"\033[36;1m{trial_cfg.get('agent', '?')}\033[0m"
+        model_str = f"\033[33;1m{trial_cfg.get('model', '?')}\033[0m"
+        effort_str = f"\033[35meffort={effort}\033[0m"
+        config_str = f"\n  {agent_str} | {model_str} | {effort_str}"
+
+    # Header
+    status_parts = []
+    if n_running:
+        status_parts.append(f"\033[32m{n_running} running\033[0m")
+    if n_done:
+        status_parts.append(f"\033[34m{n_done} done\033[0m")
+    if n_stopped:
+        status_parts.append(f"\033[33m{n_stopped} stopped\033[0m")
+    if n_pending:
+        status_parts.append(f"\033[90m{n_pending} pending\033[0m")
+
+    print(f"\n\U0001f3c3 {trial_label or 'Trial'} | {', '.join(status_parts)}{config_str}")
+    print()
+
+    # Column widths (total ~78)
+    name_w = 14
+    prog_w = 18  # "Total  Impl  Eval"
+    score_w = 7
+    resolve_w = 14
+    status_w = 14
+
+    # Header
+    hdr = (
+        f"  {'Repo':<{name_w}} {'Total Subm Eval':>{prog_w}} {'Score':>{score_w}} "
+        f"{'Resolve':>{resolve_w}}  {'Status'}"
+    )
+    print(hdr)
+    print("  " + "─" * 74)
+
+    # Accumulators
+    total_resolved = 0
+    total_graded = 0
+    total_score = 0.0
+    n_valid = 0
+
+    for s in summaries:
+        repo = s["repo"]
+        short = _short_repo_name(repo)
+        status = statuses.get(repo, "pending")
+        status_str = STATUS_ICONS.get(status, status)
+
+        if s.get("error"):
+            prog_str = "--"
+            score_str = "--"
+            resolve_str = "--"
+        else:
+            total_ms = s.get('total_milestones') or s['graded']
+            submitted = s.get('submitted', 0)
+            evaluated = s['evaluated']
+            prog_str = f"{total_ms:>4}  {submitted:>3}  {evaluated:>3}"
+            score_str = f"{s['score_reliable']:.1f}%" if evaluated > 0 else "--"
+            resolve_str = f"{s['resolve_pct']:.0f}% ({s['resolved']}/{s['graded']})"
+            total_resolved += s['resolved']
+            total_graded += s['graded']
+            total_score += s['score_reliable']
+            n_valid += 1
+
+        print(
+            f"  {short:<{name_w}} {prog_str:>{prog_w}} {score_str:>{score_w}} "
+            f"{resolve_str:>{resolve_w}}  {status_str}"
+        )
+
+    # Total row
+    print("  " + "─" * 74)
+    if n_valid > 0 and total_graded > 0:
+        avg_score = f"{total_score / n_valid:.1f}%"
+        total_resolve = f"{total_resolved * 100 / total_graded:.0f}% ({total_resolved}/{total_graded})"
+    else:
+        avg_score = "--"
+        total_resolve = "--"
+    print(f"  {'AVERAGE':<{name_w}} {'':>{prog_w}} {avg_score:>{score_w}} {total_resolve:>{resolve_w}}")
+    print()
+
+
+def print_detail_table(
+    workspace_root: Path,
+    trials: List[str],
+    trial_type: str = "e2e",
+    prefer_filtered: bool = True,
+    trial_label: str = "",
+    repo_roots: Optional[Dict[str, Path]] = None,
+):
+    """Print per-milestone detail table for a single repo, compact for 80 cols."""
+    selected_milestones, _ = load_selected_milestones(workspace_root)
+    non_graded = load_non_graded_milestones(workspace_root)
+
+    include_selected = selected_milestones
+    if trial_type == "e2e":
+        results, _ = compare_trials_e2e(workspace_root, trials, prefer_filtered, include_selected)
+    else:
+        results, _ = compare_trials(workspace_root, trials, prefer_filtered)
+
+    if not results:
+        return False
+
+    if selected_milestones is not None:
+        results = {k: v for k, v in results.items() if k in selected_milestones}
+
+    # Sort by e2e execution order if available
+    custom_order = load_e2e_execution_order(workspace_root, trials[0]) if trials else None
+    if custom_order:
+        sort_key = make_custom_sort_key(custom_order)
+        sorted_milestones = sorted(results.keys(), key=sort_key)
+    else:
+        sorted_milestones = sorted(results.keys())
+
+    repo_name = _short_repo_name(workspace_root.name)
+
+    # Count stats
+    n_graded = sum(1 for m in sorted_milestones if m not in non_graded)
+    n_evaluated = 0
+    n_resolved = 0
+    total_score = 0.0
+    for m in sorted_milestones:
+        if m in non_graded:
+            continue
+        r = results[m]["result"]
+        if r.get("eval_status") != "not_run":
+            n_evaluated += 1
+        if is_resolved(r):
+            n_resolved += 1
+        s = calculate_score_reliable(r)
+        if s is not None:
+            total_score += s
+
+    avg_score_str = f"{total_score / n_graded * 100:.1f}%" if n_graded > 0 else "--"
+    print(f"\n\U0001f4cb {repo_name} ({n_evaluated}/{n_graded} evaluated, score: {avg_score_str})")
+    print()
+
+    # Column widths
+    m_w = 22
+    f2p_w = 5
+    n2p_w = 5
+    p2p_w = 4
+    score_w = 6
+    prec_w = 6
+    rec_w = 6
+    status_w = 14
+
+    hdr = (
+        f"  {'Milestone':<{m_w}} {'F2P':>{f2p_w}} {'N2P':>{n2p_w}} "
+        f"{'P2P':>{p2p_w}} {'Score':>{score_w}} {'Prec':>{prec_w}} {'Rec':>{rec_w}}  {'Status'}"
+    )
+    print(hdr)
+    print("  " + "─" * 80)
+
+    for milestone in sorted_milestones:
+        data = results[milestone]
+        result = data["result"]
+        ts = result.get("test_summary", {})
+
+        f2p_a = ts.get("fail_to_pass_achieved", 0)
+        f2p_r = ts.get("fail_to_pass_required", 0)
+        n2p_a = ts.get("none_to_pass_achieved", 0)
+        n2p_r = ts.get("none_to_pass_required", 0)
+
+        if result.get("eval_status") == "not_run":
+            f2p_str = "--"
+            n2p_str = "--"
+            p2p_str = "--"
+            score_str = "--"
+            prec_str = "--"
+            rec_str = "--"
+            if milestone in non_graded:
+                status = "\033[90m🚫 non-graded\033[0m"
+            else:
+                status = "\033[90m⏳ pending\033[0m"
+        else:
+            f2p_str = f"{f2p_a}/{f2p_r}"
+            n2p_str = f"{n2p_a}/{n2p_r}"
+            p2p_achieved = ts.get("pass_to_pass_achieved", 0)
+            p2p_required = ts.get("pass_to_pass_required", 0)
+            p2p_failed = p2p_required - p2p_achieved
+            p2p_str = "✓" if p2p_failed == 0 else f"✗{p2p_failed}"
+
+            prec, rec = calculate_precision_recall(result)
+            prec_str = f"{prec * 100:.0f}%" if prec is not None else "--"
+            rec_str = f"{rec * 100:.0f}%" if rec is not None else "--"
+
+            if milestone in non_graded:
+                score_str = "n/a"
+                status = "\033[90m🚫 non-graded\033[0m"
+            else:
+                s = calculate_score_reliable(result)
+                score_str = f"{s * 100:.1f}%" if s is not None else "--"
+                if is_resolved(result):
+                    status = "\033[32m✅ resolved\033[0m"
+                elif check_compilation_failure(result):
+                    status = "\033[31m💥 compile\033[0m"
+                else:
+                    status = "\033[31m❌ failed\033[0m"
+
+        # Truncate milestone name if too long
+        m_display = milestone if len(milestone) <= m_w else milestone[:m_w - 2] + ".."
+
+        print(
+            f"  {m_display:<{m_w}} {f2p_str:>{f2p_w}} {n2p_str:>{n2p_w}} "
+            f"{p2p_str:>{p2p_w}} {score_str:>{score_w}} {prec_str:>{prec_w}} {rec_str:>{rec_w}}  {status}"
+        )
+
+    print("  " + "─" * 80)
+
+    # Cost/time/turns footer
+    cost = None
+    duration = None
+    turns = None
+    out_tok = None
+    for trial in trials:
+        c = load_e2e_trial_cost(workspace_root, trial)
+        if c:
+            cost = (cost or 0) + c
+        d = load_e2e_trial_duration(workspace_root, trial)
+        if d:
+            duration = (duration or 0) + d
+        t = load_e2e_trial_turns(workspace_root, trial)
+        if t:
+            turns = (turns or 0) + t
+        ot = load_e2e_trial_output_tokens(workspace_root, trial)
+        if ot:
+            out_tok = (out_tok or 0) + ot
+
+    parts = []
+    if cost is not None:
+        parts.append(f"Cost: ${cost:.2f}")
+    if duration is not None:
+        parts.append(f"Time: {format_duration(duration)}")
+    if turns is not None:
+        parts.append(f"Turns: {turns}")
+    if out_tok is not None:
+        parts.append(f"OutTok: {out_tok / 1000:.0f}k")
+    if parts:
+        print(f"  {' | '.join(parts)}")
+    print()
+    return True
 
 
 def format_cost(cost: Optional[float]) -> str:
@@ -1976,6 +2347,25 @@ def main():
         action="store_true",
         help="Merge multiple trials by taking the best score per milestone (default: show each trial separately)",
     )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        default=False,
+        help="Show compact summary table (fits 80 columns). Default for --multi-repo.",
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        default=False,
+        help="Show full wide table with all columns (original format).",
+    )
+    parser.add_argument(
+        "--detail",
+        type=str,
+        default=None,
+        metavar="REPO",
+        help="Show per-milestone detail for a specific repo (substring match).",
+    )
 
     args = parser.parse_args()
 
@@ -2025,6 +2415,47 @@ def main():
             valid_repo_keys.append(repo_key)
             repo_roots[repo_key] = ws_root
 
+        # Handle --detail mode
+        if args.detail is not None:
+            # Show trial/model/agent header
+            trial_cfg = _load_trial_config(repo_roots, trial_list[0]) if repo_roots else {}
+            if trial_cfg:
+                effort = trial_cfg.get("effort") or "n/a"
+                agent_str = f"\033[36;1m{trial_cfg.get('agent', '?')}\033[0m"
+                model_str = f"\033[33;1m{trial_cfg.get('model', '?')}\033[0m"
+                effort_str = f"\033[35meffort={effort}\033[0m"
+                print(f"\n\U0001f3c3 {trial_list[0]} | {agent_str} | {model_str} | {effort_str}")
+
+            if args.detail == "":
+                # No repo specified: show all repos that have evaluation results
+                found_any = False
+                for repo_key in valid_repo_keys:
+                    # Skip repos with no trial directory
+                    trial_dir = repo_roots[repo_key] / "e2e_trial" / trial_list[0]
+                    if not trial_dir.exists():
+                        continue
+                    result = print_detail_table(
+                        repo_roots[repo_key], trial_list, trial_type, prefer_filtered,
+                        trial_label=trial_list[0], repo_roots=repo_roots,
+                    )
+                    if result:
+                        found_any = True
+                if not found_any:
+                    print("No results found for any repo.")
+            else:
+                # Specific repo: substring match
+                matched_roots = []
+                for repo_key in valid_repo_keys:
+                    if args.detail.lower() in repo_key.lower():
+                        matched_roots.append(repo_roots[repo_key])
+                if not matched_roots:
+                    print(f"Error: no repo matching '{args.detail}' found.", file=sys.stderr)
+                    sys.exit(1)
+                for root in matched_roots:
+                    print_detail_table(root, trial_list, trial_type, prefer_filtered,
+                                       trial_label=trial_list[0], repo_roots=repo_roots)
+            sys.exit(0)
+
         # Print one table per trial
         for ti, trial in enumerate(trial_list):
             if ti > 0:
@@ -2035,7 +2466,12 @@ def main():
                 summary = compute_repo_summary(repo_roots[repo_key], [trial], trial_type, prefer_filtered)
                 summary["repo"] = repo_cfg.get("display_name", repo_key)
                 summaries.append(summary)
-            print_multi_repo_table(summaries, trial)
+
+            if args.full:
+                print_multi_repo_table(summaries, trial, repo_roots)
+            else:
+                # Default: compact mode
+                print_compact_table(summaries, trial, repo_roots, trial)
 
         sys.exit(0)
 

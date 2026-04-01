@@ -582,10 +582,18 @@ class PatchEvaluator:
         self.agent_attempt = agent_attempt
         self.keep_container = keep_container
 
-        # Extract repo name and test name from workspace_root path
-        # Path structure: .../harness_workspace/urllib3_urllib3_2.0.6_2.3.0/test_multi_stage_V2
-        self.repo_name = workspace_root.parent.name  # urllib3_urllib3_2.0.6_2.3.0
-        self.test_name = workspace_root.name  # test_multi_stage_V2
+        # Extract repo name from workspace_root path
+        # EvoClaw path structure: .../EvoClaw-data/navidrome_navidrome_v0.57.0_v0.58.0
+        # AgentBench path structure: .../harness_workspace/repo_name/test_name
+        # Detect which structure by checking if workspace_root itself has metadata.json
+        if (workspace_root / "metadata.json").exists():
+            # EvoClaw: workspace_root IS the repo directory
+            self.repo_name = workspace_root.name
+            self.test_name = None
+        else:
+            # AgentBench: workspace_root is repo/test_name
+            self.repo_name = workspace_root.parent.name
+            self.test_name = workspace_root.name
 
         # Load repo configuration
         self.repo_config = load_repo_config(self.repo_name)
@@ -617,10 +625,14 @@ class PatchEvaluator:
         print(f"📋 Test timeout: {self.test_timeout}s" if self.test_timeout else "📋 Test timeout: disabled")
         print(f"📋 Docker CPUs: {self.docker_cpus}")
 
-        # Docker image name: {repo_name_lower}/{test_name_lower}/{milestone_id_lower}
-        # Example: urllib3_urllib3_2.0.6_2.3.0/test_multi_stage_v2/m001
+        # Docker image name: {repo_name_lower}/{milestone_id_lower}
+        # EvoClaw example: navidrome_navidrome_v0.57.0_v0.58.0/milestone_006
+        # AgentBench example: urllib3_urllib3_2.0.6_2.3.0/test_multi_stage_v2/m001
         # Note: Docker image names must be lowercase (OCI spec requirement)
-        self.docker_image = f"{self.repo_name.lower()}/{self.test_name.lower()}/{milestone_id.lower()}"
+        if self.test_name:
+            self.docker_image = f"{self.repo_name.lower()}/{self.test_name.lower()}/{milestone_id.lower()}"
+        else:
+            self.docker_image = f"{self.repo_name.lower()}/{milestone_id.lower()}"
 
         # Docker container name: {repo_base}-{milestone_id}-{pid}-eval[-retry{N}]
         # Extract repo base name (e.g., "urllib3_urllib3_2.0.6_2.3.0" -> "urllib3")

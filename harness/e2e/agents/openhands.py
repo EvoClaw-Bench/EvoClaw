@@ -87,7 +87,13 @@ class OpenHandsFramework(AgentFramework):
         self._use_sdk = use_sdk
         self._enable_delegation = enable_delegation
         self._enable_condenser = enable_condenser
-        self._reasoning_effort = reasoning_effort
+        self._effective_model = model or self.DEFAULT_MODEL
+        # Default reasoning effort: xhigh for GPT, high for others
+        if reasoning_effort:
+            self._reasoning_effort = reasoning_effort
+        else:
+            leaf_model = self._effective_model.split("/")[-1].lower()
+            self._reasoning_effort = "xhigh" if "gpt" in leaf_model else "high"
 
     @property
     def use_sdk(self) -> bool:
@@ -98,6 +104,13 @@ class OpenHandsFramework(AgentFramework):
     def use_sdk(self, value: bool) -> None:
         """Set whether to use SDK mode."""
         self._use_sdk = value
+
+    def get_effective_reasoning_effort(self) -> Optional[str]:
+        """Return effective reasoning effort.
+
+        Always returns a value (default: xhigh for GPT, high for others).
+        """
+        return self._reasoning_effort
 
     def get_container_mounts(self) -> List[str]:
         """Return Docker volume mount arguments for OpenHands.
@@ -441,8 +454,11 @@ except Exception as e:
     conversation_id = None"""
 
         # Build reasoning_effort config
-        # Only pass reasoning_effort for GPT models (e.g., gpt-5, gpt-4o)
-        if reasoning_effort and "gpt" in model.lower():
+        # Pass to all models — LiteLLM handles mapping per provider:
+        #   OpenAI: native reasoning_effort parameter
+        #   Anthropic: mapped to extended thinking / budget_tokens
+        #   Others: silently ignored if unsupported
+        if reasoning_effort:
             reasoning_effort_str = f'"{reasoning_effort}"'
         else:
             reasoning_effort_str = "None"

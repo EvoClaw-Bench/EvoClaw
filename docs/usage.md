@@ -47,7 +47,7 @@ python -m harness.e2e.run_e2e \
   --srs-root /path/to/EvoClaw-data/navidrome_navidrome_v0.57.0_v0.58.0/srs \
   --workspace-root /path/to/EvoClaw-data/navidrome_navidrome_v0.57.0_v0.58.0 \
   --agent claude-code \
-  --model claude-sonnet-4-5-20250929 \
+  --model claude-sonnet-4-6 \
   --timeout 18000
 ```
 
@@ -60,11 +60,14 @@ python -m harness.e2e.run_e2e \
 | `--srs-root` | Path to SRS directory (contains `{milestone_id}/SRS.md` files) |
 | `--workspace-root` | Path to workspace with metadata, DAG, and test data |
 | `--agent` | Agent framework: `claude-code`, `codex`, `gemini-cli`, `openhands` |
-| `--model` | Model identifier (e.g., `claude-sonnet-4-5-20250929`) |
+| `--model` | Model identifier (e.g., `claude-sonnet-4-6`) |
 | `--timeout` | Max agent runtime in seconds |
 | `--reasoning-effort` | Reasoning level: `low`, `medium`, `high`, `xhigh`, `max` |
 | `--prompt-version` | Prompt template version (`v1`, `v2`) |
 | `--trial-name` | Custom trial name prefix (auto-increments with `_001` suffix) |
+| `--force` | Force remove existing container before starting a fresh trial |
+| `--remove-container` | Remove container after trial completes (default: keep running) |
+| `--skip-testbed-copy` | Skip copying `/testbed` from container after trial |
 
 ### Environment Variables
 
@@ -94,7 +97,28 @@ python -m harness.e2e.run_e2e --resume-trial /path/to/EvoClaw-data/repo_name/e2e
 
 This restores the DAG state, pending evaluations, and agent session from the existing container.
 
-> **Tip:** Use `./scripts/monitor.sh` to watch trial progress. If a repo's milestones appear stuck for a long time (usually due to agent framework memory or network issues), kill that repo's `run_e2e` process and resume it with the command above. EvoClaw will automatically continue from the latest checkpoint. This workflow pairs well with AI coding agents like [Claude Code](https://docs.anthropic.com/en/docs/claude-code), which can help you identify stuck trials, kill the right processes, and run the resume commands smoothly.
+To start a fresh trial while an existing one occupies the container, use `--force` to remove the old container:
+
+```bash
+python -m harness.e2e.run_e2e \
+  --repo-name navidrome_navidrome_v0.57.0_v0.58.0 \
+  --image navidrome_navidrome_v0.57.0_v0.58.0/base:latest \
+  --srs-root /path/to/EvoClaw-data/navidrome_.../srs \
+  --workspace-root /path/to/EvoClaw-data/navidrome_... \
+  --agent claude-code --model claude-sonnet-4-6 \
+  --timeout 18000 --trial-name my_experiment_001 \
+  --force
+```
+
+Resume options:
+
+| Flag | Description |
+|------|-------------|
+| `--resume-trial PATH` | Resume from existing trial directory (container must exist) |
+| `--no-resume-session` | In resume mode, start a new agent session instead of resuming the previous one |
+| `--force` | Force remove existing container before starting a fresh trial |
+
+> **Tip:** Use `./scripts/monitor.sh` to watch trial progress. If a repo's milestones appear stuck for a long time (usually due to agent framework memory or network issues), kill that repo's `run_e2e` process and resume it with the command above. EvoClaw will automatically continue from the latest checkpoint.
 
 ## Run a Single Milestone
 
@@ -107,7 +131,56 @@ python -m harness.e2e.run_milestone \
   --milestone-id milestone_001 \
   --srs-path /path/to/EvoClaw-data/navidrome_navidrome_v0.57.0_v0.58.0/srs/milestone_001/SRS.md \
   --agent claude-code \
-  --model claude-sonnet-4-5-20250929
+  --model claude-sonnet-4-6
+```
+
+## Monitor Progress
+
+`monitor.sh` provides three display modes for tracking experiment progress:
+
+### Compact Overview (default)
+
+Shows all repos at a glance with progress, score, and running status. Fits in 80 columns.
+
+```bash
+./scripts/monitor.sh                           # auto-detects trial name
+./scripts/monitor.sh my_experiment_001         # explicit trial name
+./scripts/monitor.sh my_experiment_001 --repos navidrome dubbo   # filter repos
+```
+
+Example output:
+```
+🏃 my_experiment_001 | 2 running, 5 pending
+  claude-code | claude-sonnet-4-6 | effort=high
+
+  Repo              Total Subm Eval   Score        Resolve  Status
+  ──────────────────────────────────────────────────────────────────────────
+  ripgrep              13    6    5   19.1%      9% (1/11)  ● running
+  navidrome             9    2    2   11.1%     11% (1/9)   ● running
+  dubbo                12    0    0      --      0% (0/12)  ○ pending
+  ...
+```
+
+- **Total**: total milestones (including non-graded)
+- **Subm**: milestones submitted by the agent (tagged)
+- **Eval**: milestones evaluated (scored)
+
+### Per-Milestone Detail
+
+Drill into a specific repo's milestones with F2P, N2P, P2P, Precision, and Recall:
+
+```bash
+./scripts/monitor.sh --detail ripgrep          # specific repo (substring match)
+./scripts/monitor.sh --detail                  # all repos that have started
+```
+
+### Full Table
+
+Original wide table with all columns (Cost, Time, Turns, OutTok). Best for wide terminals or piping to a file:
+
+```bash
+./scripts/monitor.sh --full
+./scripts/monitor.sh --full > results.txt
 ```
 
 ## Collect Results
@@ -119,16 +192,6 @@ python -m harness.e2e.collect_results \
   --workspace-root /path/to/EvoClaw-data/navidrome_navidrome_v0.57.0_v0.58.0 \
   --trials my_experiment_001 \
   --trial-type e2e
-```
-
-### Multi-Repo (via monitor.sh)
-
-```bash
-# Uses auto-generated config from run_all.py
-./scripts/monitor.sh my_experiment
-
-# Only show specific repos
-./scripts/monitor.sh my_experiment --repos navidrome dubbo
 ```
 
 ### Re-evaluate Snapshots

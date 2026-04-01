@@ -95,6 +95,16 @@ class AgentFramework(ABC):
         """
         return []
 
+    def get_effective_reasoning_effort(self) -> Optional[str]:
+        """Return the reasoning effort level actually used by the agent.
+
+        Returns the effective value after applying agent-specific defaults.
+        Returns None if the agent does not support reasoning effort.
+
+        Override in subclasses that support reasoning effort.
+        """
+        return None
+
     def extract_session_id_from_container(self, container_name: str) -> Optional[str]:
         """Extract the latest session ID directly from agent files inside the container.
 

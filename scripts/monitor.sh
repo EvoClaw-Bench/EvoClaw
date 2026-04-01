@@ -23,15 +23,32 @@ TRIAL_NAME=""
 DATA_ROOT=""
 REPOS=()
 EXTRA_ARGS=()
+DETAIL_REPO=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --data-root)  DATA_ROOT="$2"; shift 2 ;;
         --repos)      shift; while [[ $# -gt 0 ]] && [[ "$1" != --* ]]; do REPOS+=("$1"); shift; done ;;
+        --detail)
+            # --detail with optional repo argument
+            if [[ $# -ge 2 ]] && [[ "$2" != --* ]]; then
+                DETAIL_REPO="$2"; shift 2
+            else
+                DETAIL_REPO="__ALL__"; shift
+            fi
+            ;;
+        --full)       EXTRA_ARGS+=("--full"); shift ;;
         --help|-h)
-            echo "Usage: $0 <trial_name> [--data-root PATH] [--repos REPO ...] [-- extra args]"
+            echo "Usage: $0 <trial_name> [OPTIONS]"
             echo ""
             echo "  <trial_name>        Name of the trial to monitor (required)"
+            echo ""
+            echo "Display modes:"
+            echo "  (default)           Compact overview — progress, score, status (80 cols)"
+            echo "  --detail REPO       Per-milestone breakdown for a repo (substring match)"
+            echo "  --full              Full wide table with all columns"
+            echo ""
+            echo "Filters:"
             echo "  --data-root PATH    Path to EvoClaw-data (default: from trial_config.yaml)"
             echo "  --repos REPO ...    Only show these repos"
             echo "  -- ...              Extra args passed to collect_results.py"
@@ -49,18 +66,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$TRIAL_NAME" ]]; then
-    echo "Error: trial_name is required"
-    echo "Usage: $0 <trial_name> [--data-root PATH] [--repos REPO ...]"
-    exit 1
-fi
-
 # ─────────────────────────────────────────────
-# Resolve data_root
+# Resolve data_root (needed before trial auto-detect)
 # ─────────────────────────────────────────────
+EVOCLAW_CONFIG="$PROJECT_ROOT/trial_config.yaml"
 if [[ -z "$DATA_ROOT" ]]; then
     # Try reading from trial_config.yaml
-    EVOCLAW_CONFIG="$PROJECT_ROOT/trial_config.yaml"
     if [[ -f "$EVOCLAW_CONFIG" ]]; then
         DATA_ROOT=$(python3 -c "
 import yaml
@@ -77,6 +88,54 @@ fi
 
 # Resolve to absolute path
 DATA_ROOT="$(cd "$DATA_ROOT" 2>/dev/null && pwd)" || { echo "Error: data_root not found: $DATA_ROOT"; exit 1; }
+
+# ─────────────────────────────────────────────
+# Auto-detect trial name if not provided
+# ─────────────────────────────────────────────
+if [[ -z "$TRIAL_NAME" ]]; then
+    # Find all trial directories across repos
+    FOUND_TRIALS=()
+    for repo_dir in "$DATA_ROOT"/*/; do
+        [[ ! -f "$repo_dir/metadata.json" ]] && continue
+        trial_base="$repo_dir/e2e_trial"
+        [[ ! -d "$trial_base" ]] && continue
+        for trial_dir in "$trial_base"/*/; do
+            [[ ! -d "$trial_dir" ]] && continue
+            t=$(basename "$trial_dir")
+            # Deduplicate
+            local_found=false
+            for existing in "${FOUND_TRIALS[@]:-}"; do
+                [[ "$existing" == "$t" ]] && local_found=true && break
+            done
+            $local_found || FOUND_TRIALS+=("$t")
+        done
+    done
+
+    if [[ ${#FOUND_TRIALS[@]} -eq 0 ]]; then
+        echo "No trials found in $DATA_ROOT"
+        echo ""
+        echo "Usage: $0 [trial_name] [OPTIONS]"
+        echo ""
+        echo "Display modes:"
+        echo "  (default)           Compact overview — progress, score, status (80 cols)"
+        echo "  --detail REPO       Per-milestone breakdown for a repo (substring match)"
+        echo "  --full              Full wide table with all columns"
+        echo ""
+        echo "Options:"
+        echo "  --data-root PATH    Path to EvoClaw-data (default: from trial_config.yaml)"
+        echo "  --repos REPO ...    Only show these repos"
+        exit 1
+    elif [[ ${#FOUND_TRIALS[@]} -eq 1 ]]; then
+        TRIAL_NAME="${FOUND_TRIALS[0]}"
+    else
+        echo "Multiple trials found. Please specify one:"
+        echo ""
+        for t in "${FOUND_TRIALS[@]}"; do
+            echo "  $0 $t"
+        done
+        exit 1
+    fi
+fi
 
 # ─────────────────────────────────────────────
 # Auto-generate config
@@ -132,6 +191,15 @@ COLLECT_ARGS=(
     --config "$CONFIG_FILE"
     --trial-type e2e
 )
+
+# Pass --detail if specified
+if [[ -n "$DETAIL_REPO" ]]; then
+    if [[ "$DETAIL_REPO" == "__ALL__" ]]; then
+        COLLECT_ARGS+=("--detail" "")
+    else
+        COLLECT_ARGS+=("--detail" "$DETAIL_REPO")
+    fi
+fi
 
 # --repos filtering is already applied in the generated WORKSPACE_MAPPING,
 # so we don't pass --config-repos (which requires exact key match).
