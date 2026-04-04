@@ -118,6 +118,12 @@ Resume options:
 | `--no-resume-session` | In resume mode, start a new agent session instead of resuming the previous one |
 | `--model MODEL` | Override the model from the original trial (e.g., to fix a model config error) |
 | `--force` | Force remove existing container before starting a fresh trial |
+| `--remove-container` | Remove container after trial completes (default: keep running) |
+
+To clean up all containers from a specific trial:
+```bash
+docker rm -f $(docker ps -q --filter "name=my_experiment_001")
+```
 
 > **Tip:** Use `./scripts/monitor.sh` to watch trial progress. If a repo's milestones appear stuck for a long time (usually due to agent framework memory or network issues), kill that repo's `run_e2e` process and resume it with the command above. EvoClaw will automatically continue from the latest checkpoint. Milestones with evaluation infrastructure errors (e.g., Docker image issues) are automatically re-evaluated on resume.
 
@@ -145,7 +151,8 @@ Shows all repos at a glance with progress, score, and running status. Fits in 80
 
 ```bash
 ./scripts/monitor.sh                           # auto-detects trial name
-./scripts/monitor.sh my_experiment_001         # explicit trial name
+./scripts/monitor.sh my_experiment_001         # single trial
+./scripts/monitor.sh my_experiment_001 my_experiment_002  # compare multiple trials
 ./scripts/monitor.sh my_experiment_001 --repos navidrome dubbo   # filter repos
 ```
 

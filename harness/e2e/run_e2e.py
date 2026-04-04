@@ -1939,6 +1939,19 @@ Example:
     trial_name = get_next_trial_name(trial_base_name, e2e_trial_dir)
     trial_root = e2e_trial_dir / trial_name
 
+    # Refuse to overwrite an existing trial directory (prevents silent data loss)
+    if trial_root.exists() and any(trial_root.iterdir()):
+        if args.force:
+            logger.warning(f"--force specified: reusing existing trial directory '{trial_root}'")
+        else:
+            logger.error(
+                f"Trial directory already exists and is not empty: {trial_root}\n"
+                f"  To resume this trial:  python -m harness.e2e.run_e2e --resume-trial {trial_root}\n"
+                f"  To start fresh:        add --force to remove existing data\n"
+                f"  To create a new trial: use a different --trial-name"
+            )
+            sys.exit(1)
+
     logger.info(f"Creating new trial: {trial_name}")
     logger.info(f"Trial artifacts path: {trial_root}")
     trial_root.mkdir(parents=True, exist_ok=True)

@@ -92,19 +92,45 @@ def run_repo(
     srs_root = repo / "srs"
     workspace_root = repo
 
-    cmd = [
-        sys.executable, "-m", "harness.e2e.run_e2e",
-        "--repo-name", repo_name,
-        "--image", image,
-        "--srs-root", str(srs_root),
-        "--workspace-root", str(workspace_root),
-        "--agent", agent,
-        "--model", model,
-        "--timeout", str(timeout),
-        "--trial-name", trial_name,
-    ]
-    if reasoning_effort:
-        cmd.extend(["--reasoning-effort", reasoning_effort])
+    # Check if trial already exists for this repo → skip if done, auto-resume if incomplete
+    trial_dir = workspace_root / "e2e_trial" / trial_name
+    if trial_dir.exists() and any(trial_dir.iterdir()):
+        # Check if trial already completed (has summary with all milestones done)
+        summary_path = trial_dir / "evaluation" / "summary.json"
+        if summary_path.exists():
+            try:
+                import json as _json
+                with open(summary_path) as _f:
+                    _summary = _json.load(_f)
+                _rs = _summary.get("resume_state", {})
+                _completed = set(_rs.get("completed_milestones", []))
+                _total = _summary.get("total_milestones", 0)
+                if _total > 0 and len(_completed) >= _total:
+                    elapsed_str = "0:00:00"
+                    print(f"\033[0;34m[SKIP]\033[0m   {repo_name}  (already completed)")
+                    results[repo_name] = ("success", 0)
+                    return
+            except Exception:
+                pass
+
+        cmd = [
+            sys.executable, "-m", "harness.e2e.run_e2e",
+            "--resume-trial", str(trial_dir),
+        ]
+    else:
+        cmd = [
+            sys.executable, "-m", "harness.e2e.run_e2e",
+            "--repo-name", repo_name,
+            "--image", image,
+            "--srs-root", str(srs_root),
+            "--workspace-root", str(workspace_root),
+            "--agent", agent,
+            "--model", model,
+            "--timeout", str(timeout),
+            "--trial-name", trial_name,
+        ]
+        if reasoning_effort:
+            cmd.extend(["--reasoning-effort", reasoning_effort])
 
     with semaphore:
         print(f"\033[0;32m[START]\033[0m  {repo_name}")
