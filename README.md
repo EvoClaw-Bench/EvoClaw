@@ -125,6 +125,26 @@ python scripts/run_all.py --config trial_config.yaml
 
 > See [docs/usage.md](docs/usage.md) for single-repo runs, resume, re-evaluation, result collection, and all CLI arguments.
 
+## 🔍 Troubleshooting
+
+Below are common issues you may encounter when running evaluations, along with solutions.
+
+**1. Network access blocked inside containers**
+
+Agent containers enforce an iptables-based outbound whitelist — only domains needed for API access and package management are allowed (e.g., `api.anthropic.com`, `registry.npmjs.org`, `pypi.org`). Code hosting sites (GitHub, GitLab, etc.) are explicitly blocked to prevent data leakage. If your setup routes API requests through a custom proxy, make sure the proxy domain is included in `WHITELISTED_DOMAINS` in `harness/e2e/container_setup.py`.
+
+**2. Agent exits prematurely before completing all milestones**
+
+Due to LLM capability limitations or agent framework issues, agents may exit without completing all milestones. For example, out of memory, hitting API errors, or getting stuck in implementation loops without submitting. EvoClaw handles this with a built-in resume mechanism that recovers the agent session and continues from where it left off:
+
+```bash
+python -m harness.e2e.run_e2e --resume-trial /path/to/trial_dir
+```
+
+When possible, the agent resumes within the same session context, preserving its memory of all previous work. If the session becomes unrecoverable (e.g., corrupted state or context overflow after many turns), EvoClaw automatically falls back to a new session. In either case, all prior code changes and git state (commits, tags) are preserved in the container, so the agent can continue from the current codebase state.
+
+> **Evaluation protocol**: The reported results in the EvoClaw benchmark follow a protocol where trials are resumed until all milestones are submitted and evaluated, unless three consecutive resumes yield no new submissions. We encourage reproducibility studies to follow the same setting.
+
 ## 🤝 Contributing
 
 We welcome contributions! Whether it's adding support for new agents, new task domains, new datasets, bug fixes, or documentation improvements.

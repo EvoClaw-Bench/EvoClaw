@@ -42,27 +42,36 @@ from harness.test_runner.core.report_parser import convert_to_summary
 logger = logging.getLogger(__name__)
 
 
-def load_repo_config(repo_name: str) -> dict:
+def load_repo_config(repo_name: str, workspace_root: Optional[Path] = None) -> dict:
     """Load repository-specific config from config/{repo_name}.yaml.
+
+    Searches for the config file in the following order:
+    1. {data_root}/config/{repo_name}.yaml  (workspace_root's parent)
+    2. {project_root}/config/{repo_name}.yaml  (legacy fallback)
 
     Args:
         repo_name: Repository name (e.g., 'microsoft_markitdown_v0.1.1_v0.1.3')
+        workspace_root: Path to the workspace root (e.g., .../EvoClaw-data/repo_name)
 
     Returns:
         Dictionary with config values, or empty dict if not found
     """
-    # evaluator.py is in harness/e2e/, so go up two levels to get project root
+    search_paths = []
+    if workspace_root:
+        search_paths.append(workspace_root.parent / "config" / f"{repo_name}.yaml")
+    # Legacy fallback: project_root/config/
     project_root = Path(__file__).parent.parent.parent
-    config_path = project_root / "config" / f"{repo_name}.yaml"
+    search_paths.append(project_root / "config" / f"{repo_name}.yaml")
 
-    if config_path.exists():
-        try:
-            with open(config_path, "r") as f:
-                config = yaml.safe_load(f)
-                logger.info(f"Loaded repo config from {config_path}")
-                return config if config else {}
-        except Exception as e:
-            logger.warning(f"Failed to load repo config from {config_path}: {e}")
+    for config_path in search_paths:
+        if config_path.exists():
+            try:
+                with open(config_path, "r") as f:
+                    config = yaml.safe_load(f)
+                    logger.info(f"Loaded repo config from {config_path}")
+                    return config if config else {}
+            except Exception as e:
+                logger.warning(f"Failed to load repo config from {config_path}: {e}")
     return {}
 
 
@@ -596,7 +605,7 @@ class PatchEvaluator:
             self.test_name = workspace_root.name
 
         # Load repo configuration
-        self.repo_config = load_repo_config(self.repo_name)
+        self.repo_config = load_repo_config(self.repo_name, workspace_root=workspace_root)
 
         # Load test_dir and test_workdir from metadata.json if available
         metadata_path = workspace_root / "metadata.json"

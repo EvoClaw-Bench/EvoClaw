@@ -200,6 +200,7 @@ class E2EOrchestrator:
         generated_patterns: Optional[list[str]] = None,  # Generated code patterns for snapshot inclusion
         modifiable_test_patterns: Optional[list[str]] = None,  # Test files agent can modify
         main_branch: str = "main",  # Main branch name from repo config
+        drop_params: bool = False,  # Strip unsupported API params via in-container proxy
     ):
         self.repo_name = repo_name
         self.milestone_version = milestone_version
@@ -213,6 +214,7 @@ class E2EOrchestrator:
         self.repo_src_dirs = repo_src_dirs
         self.test_dirs = test_dirs
         self.main_branch = main_branch
+        self.drop_params = drop_params
 
         # Create SrcFileFilter for filtering test and excluded files from snapshots
         # All filtering (test_dirs, exclude_patterns) is done through SrcFileFilter
@@ -242,6 +244,7 @@ class E2EOrchestrator:
             agent_name=self.agent_name,
             e2e_workspace_path=self.e2e_workspace_path,
             agent_framework_name=self.agent_name,  # agent_name is the framework (e.g., "gemini-cli")
+            drop_params=self.drop_params,
         )
 
         # Load config (priority: config_path > trial_root > workspace_root > harness/e2e default)

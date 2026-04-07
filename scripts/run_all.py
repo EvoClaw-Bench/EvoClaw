@@ -83,6 +83,7 @@ def run_repo(
     timeout: int,
     trial_name: str,
     reasoning_effort: str | None,
+    drop_params: bool,
     semaphore: threading.Semaphore,
     results: dict,
 ):
@@ -94,7 +95,9 @@ def run_repo(
 
     # Check if trial already exists for this repo → skip if done, auto-resume if incomplete
     trial_dir = workspace_root / "e2e_trial" / trial_name
-    if trial_dir.exists() and any(trial_dir.iterdir()):
+    metadata_path = trial_dir / "trial_metadata.json"
+    can_resume = trial_dir.exists() and metadata_path.exists()
+    if can_resume:
         # Check if trial already completed (has summary with all milestones done)
         summary_path = trial_dir / "evaluation" / "summary.json"
         if summary_path.exists():
@@ -118,6 +121,12 @@ def run_repo(
             "--resume-trial", str(trial_dir),
         ]
     else:
+        # Clean up incomplete trial directory (no metadata = never initialized)
+        if trial_dir.exists():
+            import shutil
+            print(f"\033[0;33m[CLEAN]\033[0m  {repo_name}  (removing incomplete trial dir)")
+            shutil.rmtree(trial_dir)
+
         cmd = [
             sys.executable, "-m", "harness.e2e.run_e2e",
             "--repo-name", repo_name,
@@ -131,6 +140,8 @@ def run_repo(
         ]
         if reasoning_effort:
             cmd.extend(["--reasoning-effort", reasoning_effort])
+        if drop_params:
+            cmd.append("--drop-params")
 
     with semaphore:
         print(f"\033[0;32m[START]\033[0m  {repo_name}")
@@ -186,6 +197,7 @@ def main():
     model = cfg.get("model", "claude-sonnet-4-5-20250929")
     timeout = cfg.get("timeout", 18000)
     reasoning_effort = cfg.get("reasoning_effort", None)
+    drop_params = cfg.get("drop_params", False)
     max_parallel = args.max_parallel if args.max_parallel is not None else cfg.get("max_parallel", None)
     repo_filters = args.repos or cfg.get("repos", None)
 
@@ -245,7 +257,7 @@ def main():
     for repo in repos:
         t = threading.Thread(
             target=run_repo,
-            args=(repo, agent, model, timeout, trial_name, reasoning_effort, semaphore, results),
+            args=(repo, agent, model, timeout, trial_name, reasoning_effort, drop_params, semaphore, results),
             daemon=True,
         )
         threads.append(t)

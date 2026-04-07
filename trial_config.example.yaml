@@ -39,3 +39,13 @@ timeout: 18000
 # Default: all repos run simultaneously. Uncomment to limit,
 # e.g., if you have limited GPU/memory or API rate limits.
 # max_parallel: 3
+
+# Enabling drop_params starts a lightweight proxy inside the container that
+# automatically strips these unsupported parameters before forwarding to
+# your API endpoint. This is only needed when the agent's native API format
+# doesn't match the model provider — for example:
+#   - Claude Code (Anthropic API) → GLM, GPT, Gemini via LiteLLM
+#   - Codex (OpenAI API) → Claude, Gemini via LiteLLM
+# You do NOT need this when using an agent with its native model
+# (e.g., Claude Code + Claude, Codex + GPT).
+# drop_params: true

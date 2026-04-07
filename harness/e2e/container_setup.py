@@ -120,6 +120,9 @@ CDN_CIDR_RANGES = [
 class ContainerSetup:
     """Docker container initialization with fakeroot user and Claude credentials."""
 
+    # Port used by the in-container API filter proxy
+    _PROXY_PORT = 8181
+
     def __init__(
         self,
         container_name: str,
@@ -128,6 +131,7 @@ class ContainerSetup:
         agent_name: str = "claude-code",
         e2e_workspace_path: Optional[Path] = None,
         agent_framework_name: str = "claude-code",
+        drop_params: bool = False,
     ):
         """Initialize container setup.
 
@@ -138,6 +142,10 @@ class ContainerSetup:
             agent_name: Git user name for agent commits (default: claude)
             e2e_workspace_path: Path to mount as /e2e_workspace (for E2E mode)
             agent_framework_name: Agent framework to use (default: claude-code)
+            drop_params: If True, run an in-container proxy that strips
+                unsupported API parameters (e.g. context_management) before
+                forwarding to the upstream API. Useful when routing requests
+                through a LiteLLM proxy to non-native models.
         """
         self.container_name = container_name
         self.image_name = image_name
@@ -145,6 +153,7 @@ class ContainerSetup:
         self.agent_name = agent_name
         self.e2e_workspace_path = Path(e2e_workspace_path) if e2e_workspace_path else None
         self._framework: AgentFramework = get_agent_framework(agent_framework_name)
+        self.drop_params = drop_params
 
     def get_agent_mounts(self) -> list[str]:
         """Return Docker volume mount arguments for the agent.
@@ -160,11 +169,33 @@ class ContainerSetup:
         """Return Docker environment variable arguments for the agent.
 
         Delegates to the agent framework for agent-specific env vars.
+        When drop_params is enabled, intercepts *_BASE_URL variables and
+        redirects them to the in-container proxy.
 
         Returns:
             List of -e arguments for docker run
         """
-        return self._framework.get_container_env_vars()
+        env_vars = self._framework.get_container_env_vars()
+        if not self.drop_params:
+            return env_vars
+
+        # Intercept BASE_URL env vars: save original as upstream, redirect to proxy
+        result = []
+        proxy_url = f"http://localhost:{self._PROXY_PORT}"
+        i = 0
+        while i < len(env_vars):
+            if env_vars[i] == "-e" and i + 1 < len(env_vars):
+                kv = env_vars[i + 1]
+                if "_BASE_URL=" in kv:
+                    key, _, value = kv.partition("=")
+                    result.extend(["-e", f"API_PROXY_UPSTREAM={value}"])
+                    result.extend(["-e", f"{key}={proxy_url}"])
+                    logger.info(f"  drop_params: {key} redirected to in-container proxy (upstream: {value})")
+                    i += 2
+                    continue
+            result.append(env_vars[i])
+            i += 1
+        return result
 
     # Backward compatibility alias
     def get_claude_mounts(self) -> list[str]:
@@ -377,24 +408,138 @@ except Exception as e:
 print("Base container initialization complete!")
 '''
 
+    def _get_proxy_init_script(self) -> str:
+        """Return Python init script that starts an API filter proxy daemon.
+
+        The proxy strips non-standard parameters (e.g. context_management)
+        from API requests before forwarding to the upstream URL. This allows
+        agent CLIs to work with third-party models through LiteLLM proxies
+        that don't have drop_params enabled.
+
+        The proxy reads API_PROXY_UPSTREAM env var for the upstream URL
+        and listens on localhost:{_PROXY_PORT}.
+        """
+        return f'''
+# === API Filter Proxy ===
+try:
+    import os, textwrap
+    proxy_script = textwrap.dedent("""\\
+        import json, os, sys
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        from socketserver import ThreadingMixIn
+        class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+            daemon_threads = True
+        import urllib.request, urllib.error
+
+        UPSTREAM = os.environ.get("API_PROXY_UPSTREAM", "")
+        DROP = {{"context_management"}}
+
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                try:
+                    data = json.loads(body)
+                    for k in DROP & set(data):
+                        del data[k]
+                    body = json.dumps(data).encode()
+                except Exception:
+                    pass
+                target = UPSTREAM.rstrip("/") + self.path
+                hdrs = {{k: v for k, v in self.headers.items() if k.lower() != "host"}}
+                hdrs["Content-Length"] = str(len(body))
+                req = urllib.request.Request(target, data=body, headers=hdrs, method="POST")
+                try:
+                    with urllib.request.urlopen(req, timeout=600) as r:
+                        rb = r.read()
+                        self.send_response(r.status)
+                        for k, v in r.getheaders():
+                            if k.lower() not in ("transfer-encoding", "connection"):
+                                self.send_header(k, v)
+                        self.end_headers()
+                        self.wfile.write(rb)
+                except urllib.error.HTTPError as e:
+                    rb = e.read()
+                    self.send_response(e.code)
+                    for k, v in e.headers.items():
+                        if k.lower() not in ("transfer-encoding", "connection"):
+                            self.send_header(k, v)
+                    self.end_headers()
+                    self.wfile.write(rb)
+
+            def do_GET(self):
+                target = UPSTREAM.rstrip("/") + self.path
+                hdrs = {{k: v for k, v in self.headers.items() if k.lower() != "host"}}
+                req = urllib.request.Request(target, headers=hdrs, method="GET")
+                try:
+                    with urllib.request.urlopen(req, timeout=60) as r:
+                        rb = r.read()
+                        self.send_response(r.status)
+                        for k, v in r.getheaders():
+                            if k.lower() not in ("transfer-encoding", "connection"):
+                                self.send_header(k, v)
+                        self.end_headers()
+                        self.wfile.write(rb)
+                except urllib.error.HTTPError as e:
+                    rb = e.read()
+                    self.send_response(e.code)
+                    for k, v in e.headers.items():
+                        if k.lower() not in ("transfer-encoding", "connection"):
+                            self.send_header(k, v)
+                    self.end_headers()
+                    self.wfile.write(rb)
+
+            def log_message(self, fmt, *args):
+                pass  # silent
+
+        ThreadedHTTPServer(("127.0.0.1", {self._PROXY_PORT}), H).serve_forever()
+    """)
+    proxy_path = "/usr/local/bin/api_filter_proxy.py"
+    with open(proxy_path, "w") as f:
+        f.write(proxy_script)
+    os.chmod(proxy_path, 0o755)
+
+    # Start proxy as background daemon
+    import subprocess
+    subprocess.Popen(
+        ["python3", proxy_path],
+        stdout=open("/tmp/api_proxy.log", "w"),
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+    # Wait briefly and verify it started
+    import time
+    time.sleep(1)
+    try:
+        import urllib.request
+        urllib.request.urlopen("http://127.0.0.1:{self._PROXY_PORT}/", timeout=2)
+    except Exception:
+        pass  # GET to proxy may error, but connection success means it's running
+    print("API filter proxy started on port {self._PROXY_PORT}")
+except Exception as e:
+    print(f"Warning: Failed to start API filter proxy: {{e}}")
+'''
+
     def get_init_script(self) -> str:
         """Return Python init script for container setup.
 
         Combines base initialization with agent-specific initialization.
         The base script sets up fakeroot user, sudo, git config.
         The agent-specific script sets up credentials, tools, etc.
+        Optionally includes an API filter proxy for drop_params mode.
 
         Returns:
             Combined Python script as a string
         """
         base_script = self._get_base_init_script()
         agent_script = self._framework.get_container_init_script(self.agent_name)
+        proxy_script = self._get_proxy_init_script() if self.drop_params else ""
 
         return f"""{base_script}
 
 # === Agent-specific initialization ===
 {agent_script}
-
+{proxy_script}
 print("Container initialization complete!")
 """
 
@@ -441,6 +586,7 @@ print("Container initialization complete!")
             "--cap-add=NET_ADMIN",
             "--sysctl",
             "net.ipv6.conf.all.disable_ipv6=1",
+            "--add-host=host.docker.internal:host-gateway",
             "--name",
             self.container_name,
             "--ulimit",

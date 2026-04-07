@@ -252,4 +252,5 @@ litellm.log
 
 # EvoClaw trial config (user-specific) and auto-generated collect configs
 trial_config.yaml
+trial_configs/
 .evoclaw/

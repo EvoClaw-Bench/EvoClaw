@@ -40,7 +40,7 @@ class CodexFramework(AgentFramework):
     # litellm's native /v1/responses reconstructs the SSE stream and drops
     # events (response.output_item.added, response.content_part.added),
     # causing Codex CLI to fail with "OutputTextDelta without active item".
-    PASSTHROUGH_MODELS = {"gpt-5.3-codex"}
+    PASSTHROUGH_MODELS: set[str] = set()
 
     def __init__(
         self,
@@ -265,13 +265,19 @@ try:
         os.chmod(auth_dst, 0o600)
         print(f"Copied Codex auth file to {auth_dst}")
 
-    config_src = Path('/tmp/host-codex/config.toml')
+    # Generate a clean config.toml with only the settings we need.
+    # Do NOT copy the host config.toml — it may contain wrong model defaults,
+    # MCP tokens, and other settings that interfere with the evaluation.
     config_dst = codex_dir / 'config.toml'
-    if config_src.exists():
-        shutil.copy2(config_src, config_dst)
-        os.chown(config_dst, uid, gid)
-        os.chmod(config_dst, 0o600)
-        print(f"Copied Codex config file to {config_dst}")
+    base_url = os.environ.get('OPENAI_BASE_URL', '')
+    config_lines = []
+    if base_url:
+        config_lines.append(f'openai_base_url = "{base_url}"')
+    with open(config_dst, 'w') as f:
+        f.write('\\n'.join(config_lines) + '\\n')
+    os.chown(config_dst, uid, gid)
+    os.chmod(config_dst, 0o600)
+    print(f"Generated clean config.toml (openai_base_url={base_url or 'default'})")
 
 except Exception as e:
     print(f"Error setting up Codex OAuth files: {e}")

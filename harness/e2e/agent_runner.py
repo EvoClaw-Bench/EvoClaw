@@ -50,6 +50,7 @@ class AgentRunner:
         reasoning_effort: Optional[str] = None,
         use_sdk: bool = False,
         include_directories: Optional[list[str]] = None,
+        drop_params: bool = False,
     ):
         """Initialize agent runner.
 
@@ -63,6 +64,8 @@ class AgentRunner:
             reasoning_effort: Reasoning effort level for Codex ("low", "medium", "high")
             use_sdk: For OpenHands, use SDK mode instead of CLI mode
             include_directories: Extra directories for agent (e.g., ["/e2e_workspace"])
+            drop_params: If True, don't pass *_BASE_URL env vars to docker exec
+                (rely on the in-container proxy set up by ContainerSetup).
         """
         self.container_name = container_name
         self.workdir = workdir
@@ -71,6 +74,7 @@ class AgentRunner:
         self.log_dir = Path(log_dir) if log_dir else None
         self.session_id: Optional[str] = None
         self.agent_name = agent_name
+        self.drop_params = drop_params
 
         # Build framework kwargs
         framework_kwargs = {}
@@ -89,6 +93,25 @@ class AgentRunner:
         self.logger = logging.getLogger(f"agent.{container_name}")
         self._last_auth_error = False  # Set by _execute_with_streaming on auth failures
         self._last_rate_limit = False  # Set by _execute_with_streaming on rate limit
+
+    def _get_exec_env_vars(self) -> list[str]:
+        """Return env var args for docker exec.
+
+        When drop_params is enabled, strips *_BASE_URL vars so the agent
+        uses the in-container proxy URL from container initialization.
+        """
+        env_vars = self._framework.get_container_env_vars()
+        if not self.drop_params:
+            return env_vars
+        filtered = []
+        i = 0
+        while i < len(env_vars):
+            if env_vars[i] == "-e" and i + 1 < len(env_vars) and "_BASE_URL=" in env_vars[i + 1]:
+                i += 2
+                continue
+            filtered.append(env_vars[i])
+            i += 1
+        return filtered
         self._rate_limit_reset_seconds: Optional[int] = None  # Seconds until rate limit resets
         # Set when repeated 500 errors suggest a possible model/backend compatibility issue (inferred).
         self._last_model_unavailable = False
@@ -587,7 +610,7 @@ class AgentRunner:
         ]
 
         # Add framework-specific environment variables (e.g., CODEX_API_KEY)
-        docker_exec_cmd.extend(self._framework.get_container_env_vars())
+        docker_exec_cmd.extend(self._get_exec_env_vars())
 
         docker_exec_cmd.extend(
             [
@@ -860,7 +883,7 @@ class AgentRunner:
         ]
 
         # Add framework-specific environment variables (e.g., CODEX_API_KEY)
-        docker_exec_cmd.extend(self._framework.get_container_env_vars())
+        docker_exec_cmd.extend(self._get_exec_env_vars())
 
         docker_exec_cmd.extend(
             [
@@ -999,6 +1022,7 @@ class E2EAgentRunner(AgentRunner):
         timeout_ms: int = 3600_000,  # 1 hour default for E2E
         prompt_version: str = "v1",
         reasoning_effort: Optional[str] = None,
+        drop_params: bool = False,
     ):
         """Initialize E2E agent runner.
 
@@ -1012,6 +1036,7 @@ class E2EAgentRunner(AgentRunner):
             timeout_ms: Execution timeout in milliseconds
             prompt_version: Prompt template version (e.g., "v1")
             reasoning_effort: Reasoning effort level for GPT-5 models
+            drop_params: Strip unsupported API params via in-container proxy
         """
         self.output_dir = Path(output_dir) if output_dir else None
         # Use output_dir directly as log_dir (consistent with milestone trial structure)
@@ -1026,6 +1051,7 @@ class E2EAgentRunner(AgentRunner):
             agent_name=agent_name,  # Pass framework name to parent
             reasoning_effort=reasoning_effort,
             include_directories=["/e2e_workspace"],
+            drop_params=drop_params,
         )
 
         self.repo_src_dirs = repo_src_dirs

@@ -74,8 +74,21 @@ with open('$EVOCLAW_CONFIG') as f:
 print(cfg.get('data_root', ''))
 " 2>/dev/null)
     fi
+    # Fallback: scan trial_configs/ directory for any config with data_root
+    if [[ -z "$DATA_ROOT" && -d "$PROJECT_ROOT/trial_configs" ]]; then
+        for cfg_file in "$PROJECT_ROOT"/trial_configs/*.yaml; do
+            [[ -f "$cfg_file" ]] || continue
+            DATA_ROOT=$(python3 -c "
+import yaml
+with open('$cfg_file') as f:
+    cfg = yaml.safe_load(f)
+print(cfg.get('data_root', ''))
+" 2>/dev/null)
+            [[ -n "$DATA_ROOT" ]] && break
+        done
+    fi
     if [[ -z "$DATA_ROOT" ]]; then
-        echo "Error: --data-root not specified and no data_root found in trial_config.yaml"
+        echo "Error: --data-root not specified and no data_root found in trial_config.yaml or trial_configs/*.yaml"
         exit 1
     fi
 fi
@@ -209,4 +222,191 @@ if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
     COLLECT_ARGS+=("${EXTRA_ARGS[@]}")
 fi
 
-exec "${COLLECT_ARGS[@]}"
+"${COLLECT_ARGS[@]}"
+
+# ─────────────────────────────────────────────
+# Session timeline table
+# ─────────────────────────────────────────────
+export EVOCLAW_DATA_ROOT="$DATA_ROOT"
+export EVOCLAW_TRIAL_NAMES="$(IFS=,; echo "${RESOLVED_TRIALS[*]}")"
+python3 << 'TIMELINE_EOF'
+import json, os, sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+data_root = os.environ.get("EVOCLAW_DATA_ROOT", "")
+trial_names_str = os.environ.get("EVOCLAW_TRIAL_NAMES", "")
+if not data_root or not trial_names_str:
+    sys.exit(0)
+
+trial_names = trial_names_str.split(",")
+now = datetime.now(timezone.utc)
+
+# ANSI colors for session ID coloring
+COLORS = [
+    "\033[36m",  # cyan
+    "\033[33m",  # yellow
+    "\033[35m",  # magenta
+    "\033[32m",  # green
+    "\033[34m",  # blue
+    "\033[91m",  # bright red
+    "\033[96m",  # bright cyan
+    "\033[93m",  # bright yellow
+]
+RESET = "\033[0m"
+DIM = "\033[90m"
+BOLD = "\033[1m"
+
+rows = []  # (repo_short, session_short, start, end, duration_str, is_running, color_idx)
+
+for trial_name in trial_names:
+    # Collect session data from all repos
+    session_color_map = {}
+    color_counter = 0
+
+    for repo_dir in sorted(Path(data_root).iterdir()):
+        if not repo_dir.is_dir():
+            continue
+        trial_dir = repo_dir / "e2e_trial" / trial_name
+        history_file = trial_dir / "log" / "session_history.jsonl"
+        metadata_file = trial_dir / "trial_metadata.json"
+
+        if not history_file.exists():
+            continue
+
+        # Get repo short name: '{owner}_{project}_{v1}_{v2}' → '{project}'
+        parts = repo_dir.name.split("_")
+        repo_short = parts[1] if len(parts) >= 2 else parts[0]
+
+        # Read start_time from metadata
+        trial_start = None
+        if metadata_file.exists():
+            try:
+                with open(metadata_file) as f:
+                    meta = json.load(f)
+                trial_start = meta.get("start_time", "")
+            except Exception:
+                pass
+
+        # Parse session history
+        events = []
+        with open(history_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except Exception:
+                    continue
+
+        # Build session segments: each exec_start → exec_end pair is a row
+        segments = []
+        for ev in events:
+            ts_str = ev.get("ts", "")
+            event_type = ev.get("event", "")
+            sid = ev.get("session_id", "")
+
+            try:
+                ts = datetime.fromisoformat(ts_str)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+
+            if event_type == "agent_exec_start":
+                segments.append({"session_id": sid, "start": ts, "end": None, "success": None})
+            elif event_type == "agent_exec_end" and segments:
+                # Match to last open segment
+                for seg in reversed(segments):
+                    if seg["end"] is None:
+                        seg["end"] = ts
+                        seg["success"] = ev.get("success", None)
+                        break
+
+        for seg in segments:
+            sid = seg["session_id"]
+            if sid not in session_color_map:
+                session_color_map[sid] = color_counter % len(COLORS)
+                color_counter += 1
+
+            start = seg["start"]
+            end = seg["end"] or now
+            is_running = seg["end"] is None
+            duration = end - start
+            total_sec = int(duration.total_seconds())
+            h, rem = divmod(total_sec, 3600)
+            m, s = divmod(rem, 60)
+            if h > 0:
+                dur_str = f"{h}h{m:02d}m{s:02d}s"
+            else:
+                dur_str = f"{m}m{s:02d}s"
+
+            rows.append((
+                repo_short,
+                sid[:8],
+                start.strftime("%H:%M:%S"),
+                end.strftime("%H:%M:%S") if not is_running else "running…",
+                dur_str,
+                is_running,
+                session_color_map[sid],
+            ))
+
+if not rows:
+    sys.exit(0)
+
+# Also compute total trial elapsed
+total_elapsed = ""
+for trial_name in trial_names:
+    for repo_dir in sorted(Path(data_root).iterdir()):
+        meta_file = repo_dir / "e2e_trial" / trial_name / "trial_metadata.json"
+        if meta_file.exists():
+            try:
+                with open(meta_file) as f:
+                    meta = json.load(f)
+                start_str = meta.get("start_time", "")
+                start_dt = datetime.fromisoformat(start_str)
+                if start_dt.tzinfo is None:
+                    start_dt = start_dt.replace(tzinfo=timezone.utc)
+                elapsed = now - start_dt
+                total_sec = int(elapsed.total_seconds())
+                h, m, s = total_sec // 3600, (total_sec % 3600) // 60, total_sec % 60
+                total_elapsed = f"{h}h{m:02d}m{s:02d}s"
+            except Exception:
+                pass
+            break
+    if total_elapsed:
+        break
+
+# Group rows by repo
+from collections import OrderedDict
+grouped = OrderedDict()
+for row in rows:
+    repo = row[0]
+    grouped.setdefault(repo, []).append(row)
+
+# Print table
+print()
+header_suffix = f"  (elapsed: {total_elapsed})" if total_elapsed else ""
+print(f"  {BOLD}Session Timeline{RESET}{header_suffix}")
+print()
+print(f"  {'Repo':<14} {'Session':<10} {'Start':>10}  {'End':>10}  {'Duration':>10}  Status")
+print(f"  {'─'*14} {'─'*10} {'─'*10}  {'─'*10}  {'─'*10}  {'─'*10}")
+
+repo_list = list(grouped.keys())
+for ri, repo in enumerate(repo_list):
+    repo_rows = grouped[repo]
+    for i, (_, sid, start, end, dur, is_running, cidx) in enumerate(repo_rows):
+        color = COLORS[cidx]
+        status = f"\033[32m● running{RESET}" if is_running else f"{DIM}✓ done{RESET}"
+        is_last = (i == len(repo_rows) - 1)
+        if i == 0:
+            label = f"{repo:<14}"
+        else:
+            prefix = "└──" if is_last else "├──"
+            label = f"{DIM}{prefix}{RESET}{'':11}"
+        print(f"  {label} {color}{sid}{RESET}  {start:>10}  {end:>10}  {dur:>10}  {status}")
+    if ri < len(repo_list) - 1:
+        print()
+print()
+TIMELINE_EOF

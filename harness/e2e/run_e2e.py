@@ -1106,6 +1106,7 @@ class E2ETrialRunner:
             timeout_ms=self.timeout_ms,
             prompt_version=self.prompt_version,
             reasoning_effort=self.reasoning_effort,
+            drop_params=self.orchestrator.drop_params,
         )
 
         # Capture initial state
@@ -1748,6 +1749,7 @@ def _run_resume_mode(args):
         exclude_patterns=exclude_patterns,
         generated_patterns=generated_patterns,
         modifiable_test_patterns=modifiable_test_patterns,
+        drop_params=metadata.get("drop_params", False),
     )
 
     # Prepare agent output directory (reuse existing)
@@ -1859,6 +1861,13 @@ Example:
         "--remove-container",
         action="store_true",
         help="Remove container after trial completes (default: keep container running)",
+    )
+
+    parser.add_argument(
+        "--drop-params",
+        action="store_true",
+        help="Run an in-container proxy that strips unsupported API parameters "
+        "(e.g. context_management) before forwarding. Useful for non-native models via LiteLLM.",
     )
 
     parser.add_argument(
@@ -2025,6 +2034,7 @@ Example:
         "dag_path": str(dag_path),
         "srs_root": str(args.srs_root),
         "workspace_root": str(args.workspace_root),
+        "drop_params": args.drop_params,
     }
     metadata_path = trial_root / "trial_metadata.json"
     with open(metadata_path, "w") as f:
@@ -2048,6 +2058,7 @@ Example:
         exclude_patterns=exclude_patterns,  # Exclude patterns for SrcFileFilter
         generated_patterns=generated_patterns,  # Generated code patterns for snapshot inclusion
         modifiable_test_patterns=modifiable_test_patterns,  # Test files agent can modify
+        drop_params=args.drop_params,
     )
 
     # Prepare agent output directory
