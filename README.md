@@ -18,7 +18,7 @@
 ---
 
 > [!NOTE]
-> **GPT-5.4** (xhigh) achieves **2nd place** among all models at **33.71%** score. See the [leaderboard](https://evo-claw.com).
+> 🆕 **GPT-5.4** (xhigh) achieves **2nd place** among all models at **33.71%** score. See the [leaderboard](https://evo-claw.com).
 
 Most existing benchmarks evaluate agents on **isolated, one-shot tasks**. But real-world workflows are not a bag of independent missions, they are continuous processes where tasks build on each other, dependencies interleave, and context accumulates over a long session.
 
