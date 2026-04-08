@@ -1557,7 +1557,10 @@ def _load_trial_config(repo_roots: Dict[str, Path], trial: str) -> Dict[str, str
                     }
                     effort = _effort_defaults.get(agent)
 
-                # Detect context window from agent_stats.json modelUsage
+                # Detect context window from agent_stats.json modelUsage.
+                # Codex CLI reports the *compressed* context window (95% of the
+                # model's actual context).  Recover the model context window so
+                # the display matches the model spec (e.g. 272K, not 258K).
                 context_window = None
                 stats_path = ws_root / "e2e_trial" / trial / "agent_stats.json"
                 if stats_path.exists():
@@ -1572,6 +1575,9 @@ def _load_trial_config(repo_roots: Dict[str, Path], trial: str) -> Dict[str, str
                         elif mu:
                             # Fallback: use the first model entry
                             context_window = next(iter(mu.values()), {}).get("contextWindow")
+                        # Recover model context from Codex's 95% compressed value
+                        if context_window and meta.get("agent_name") == "codex":
+                            context_window = round(context_window / 0.95)
                     except Exception:
                         pass
 

@@ -337,20 +337,20 @@ class CodexLogParser(AgentLogParser):
         )
 
     # Token pricing per 1M tokens.
-    # Verified against OpenAI's pricing page on 2026-03-06.
-    # https://openai.com/api/pricing/
+    # Verified against https://developers.openai.com/api/docs/models on 2026-04-08.
     #
     # Pricing entries can be either:
     # - flat: {"input": ..., "cached_input": ..., "output": ...}
     # - tiered: {"tiers": [{"threshold": ..., ...}, ...]}
     #
-    # For GPT-5.4, prompts above 272K input tokens are billed at higher rates.
+    # For GPT-5.4, prompts above 272K input tokens are billed at 2x input
+    # and 1.5x output for the full session.
     # Reasoning/thought tokens are billed as output tokens.
     TOKEN_PRICING = {
         "gpt-5.4": {
             "tiers": [
-                {"threshold": 272_000, "input": 2.00, "cached_input": 0.50, "output": 16.00},
-                {"threshold": float("inf"), "input": 4.00, "cached_input": 1.00, "output": 24.00},
+                {"threshold": 272_000, "input": 2.50, "cached_input": 0.25, "output": 15.00},
+                {"threshold": float("inf"), "input": 5.00, "cached_input": 0.50, "output": 22.50},
             ]
         },
         "gpt-5.3-codex": {"input": 1.75, "cached_input": 0.175, "output": 14.00},
@@ -365,12 +365,17 @@ class CodexLogParser(AgentLogParser):
     }
 
     @classmethod
-    def _resolve_pricing(cls, model: str, input_tokens: int) -> Dict[str, float]:
+    def _resolve_pricing(
+        cls, model: str, input_tokens: int, context_window: Optional[int] = None
+    ) -> Dict[str, float]:
         """Resolve flat or tiered pricing for a model.
 
-        For tiered models, the threshold is evaluated against the total input
-        tokens of the request, matching provider pricing rules that depend on
-        prompt size.
+        For tiered models, the threshold is evaluated against the per-request
+        input token count.  When *context_window* is provided it is used as
+        the upper-bound for per-request size (a single request can never
+        exceed the context window).  This prevents session-level aggregates
+        (which can be millions of tokens) from incorrectly triggering the
+        higher pricing tier.
         """
         pricing = cls.TOKEN_PRICING.get(model)
         if pricing is None:
@@ -384,9 +389,14 @@ class CodexLogParser(AgentLogParser):
         if not tiers:
             return pricing
 
+        # Use context_window as the tier selector when available, since
+        # input_tokens may be a session-level aggregate rather than a
+        # per-request count.
+        tier_key = context_window if context_window is not None else input_tokens
+
         for tier in tiers:
             threshold = tier["threshold"]
-            if threshold == float("inf") or input_tokens <= int(threshold):
+            if threshold == float("inf") or tier_key <= int(threshold):
                 return {
                     "input": float(tier["input"]),
                     "cached_input": float(tier["cached_input"]),
@@ -407,6 +417,7 @@ class CodexLogParser(AgentLogParser):
         output_tokens: int,
         cached_tokens: int = 0,
         reasoning_tokens: int = 0,
+        context_window: Optional[int] = None,
     ) -> float:
         """Calculate cost based on token usage.
 
@@ -428,11 +439,14 @@ class CodexLogParser(AgentLogParser):
             cached_tokens: Cached input tokens (subset of input_tokens)
             reasoning_tokens: Additional reasoning/thought tokens (default 0,
                 only use if output_tokens does NOT include reasoning)
+            context_window: Model context window size. Used for tiered pricing
+                to determine the correct tier (per-request size cannot exceed
+                context window).
 
         Returns:
             Estimated cost in USD
         """
-        pricing = self._resolve_pricing(model, input_tokens)
+        pricing = self._resolve_pricing(model, input_tokens, context_window=context_window)
 
         # Non-cached input tokens
         non_cached_input = max(0, input_tokens - cached_tokens)
@@ -457,6 +471,8 @@ class CodexLogParser(AgentLogParser):
         jsonl_files = sorted(log_dir.glob("*.jsonl"))
         if not jsonl_files:
             return units
+
+        context_window: Optional[int] = None
 
         for jsonl_file in jsonl_files:
             current_model = "unknown"
@@ -491,6 +507,11 @@ class CodexLogParser(AgentLogParser):
                         info = payload.get("info", {})
                         if not isinstance(info, dict):
                             continue
+                        if context_window is None:
+                            cw = info.get("model_context_window")
+                            if isinstance(cw, int) and cw > 0:
+                                context_window = cw
+
                         last_usage = info.get("last_token_usage", {})
                         total_usage = info.get("total_token_usage", {})
                         if not isinstance(last_usage, dict) or not isinstance(total_usage, dict):
@@ -529,6 +550,7 @@ class CodexLogParser(AgentLogParser):
                             output_tokens=output_tokens,
                             cached_tokens=cached_tokens,
                             reasoning_tokens=reasoning_tokens,
+                            context_window=context_window,
                         )
                         units.append(
                             NativeUsageUnit(
@@ -691,27 +713,37 @@ class CodexLogParser(AgentLogParser):
                         model_usage[current_model]["cachedInputTokens"] += delta_cached
 
                         # Calculate cost per model using delta (with cached tokens)
-                        # Note: output_tokens already includes reasoning tokens
+                        # Note: output_tokens already includes reasoning tokens.
+                        # Pass context_window so tiered pricing uses per-request
+                        # size (not session-level delta which can be millions).
                         turn_cost = self._calculate_cost(
                             current_model,
                             delta_input,
                             delta_output,
                             cached_tokens=delta_cached,
+                            context_window=context_window,
                         )
                         model_usage[current_model]["costUSD"] = (
                             model_usage[current_model].get("costUSD", 0.0) + turn_cost
                         )
                         total_cost += turn_cost
 
-        # Add context window and reasoning tokens to model usage
-        # Note: reasoning tokens are already included in output_tokens from turn.completed,
-        # so their cost is already accounted for in per-turn cost calculation above.
-        # We only record the count here for informational purposes, NOT add cost again.
+        # Add context window and reasoning tokens to model usage.
+        # turn.completed output_tokens does NOT include reasoning tokens,
+        # so we must add the reasoning cost separately.
         if current_model in model_usage:
             if context_window:
                 model_usage[current_model]["contextWindow"] = context_window
             if reasoning_tokens > 0:
                 model_usage[current_model]["reasoningOutputTokens"] = reasoning_tokens
+                pricing = self._resolve_pricing(
+                    current_model, 0, context_window=context_window
+                )
+                reasoning_cost = (reasoning_tokens / 1_000_000) * pricing["output"]
+                model_usage[current_model]["costUSD"] = (
+                    model_usage[current_model].get("costUSD", 0.0) + reasoning_cost
+                )
+                total_cost += reasoning_cost
 
         # Convert defaultdicts to regular dicts
         model_usage_dict = {model: dict(usage) for model, usage in model_usage.items()}
