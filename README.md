@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <b>A Continuous Task Evaluation Harness for AI Agents</b>
+  <b>A Continuous Task Evaluation Playground for AI Harness</b>
 </p>
 
 <p align="center">
