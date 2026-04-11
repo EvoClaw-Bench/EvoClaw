@@ -27,6 +27,7 @@ WHITELISTED_DOMAINS = [
     "sentry.io",
     "api.openai.com",
     "generativelanguage.googleapis.com",
+    "open.bigmodel.cn",
     # === Go module proxy (replaces direct github.com) ===
     "proxy.golang.org",
     "sum.golang.org",

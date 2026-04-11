@@ -113,6 +113,8 @@ timeout: 18000                         # optional: max agent runtime per repo (s
 ```bash
 export UNIFIED_API_KEY=sk-...
 export UNIFIED_BASE_URL=https://...   # optional, for proxy or custom endpoints
+# NOTE: if UNIFIED_BASE_URL is a custom domain, add it to WHITELISTED_DOMAINS
+# in harness/e2e/container_setup.py — agent containers block all other outbound traffic.
 python scripts/run_all.py --config trial_config.yaml
 ```
 
