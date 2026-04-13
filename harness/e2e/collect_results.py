@@ -57,6 +57,31 @@ MODEL_FAMILY_PRICING = {
         "cache_read": 0.50,
         "cache_write": 6.25,
     },
+    # Z.AI GLM models (official z.ai pricing)
+    "glm-5.1": {
+        "input": 1.4,
+        "output": 4.4,
+        "cache_read": 0.26,
+        "cache_write": 1.4,
+    },
+    "glm-5": {
+        "input": 1.0,
+        "output": 3.2,
+        "cache_read": 0.20,
+        "cache_write": 1.0,
+    },
+    "glm-4.7": {
+        "input": 0.5,
+        "output": 2.0,
+        "cache_read": 0.10,
+        "cache_write": 0.5,
+    },
+    "glm-4.5-air": {
+        "input": 0.2,
+        "output": 1.1,
+        "cache_read": 0.03,
+        "cache_write": 0.2,
+    },
 }
 
 
@@ -68,11 +93,17 @@ def _detect_model_family(model_id: str) -> Optional[str]:
         claude-sonnet-4-5-20250929 → sonnet
         claude-sonnet-4-6 → sonnet
         claude-opus-4-6 → opus
+        glm-5.1 → glm-5.1
+        glm-5 → glm-5
     """
     model_lower = model_id.lower()
     for family in ["haiku", "sonnet", "opus"]:
         if family in model_lower:
             return family
+    # GLM models: match most specific first (glm-5.1 before glm-5)
+    for glm_family in ["glm-5.1", "glm-5", "glm-4.7", "glm-4.5-air"]:
+        if glm_family in model_lower:
+            return glm_family
     return None
 
 
@@ -385,7 +416,7 @@ def load_e2e_trial_cost(workspace_root: Path, trial: str) -> Optional[float]:
 
             # Only recalculate for claude-code trials (internal pricing may be wrong)
             # For openhands trials, litellm cost is already accurate
-            if trial.startswith("_claude-code_"):
+            if "claude-code" in trial:
                 cost = recalculate_cost_from_model_usage(stats.get("modelUsage", {}))
                 if cost is not None:
                     return cost

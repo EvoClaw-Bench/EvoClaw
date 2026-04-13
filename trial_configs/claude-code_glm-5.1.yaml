@@ -1,5 +1,5 @@
 data_root: /data2/gangda/EvoClaw-data
-trial_name: claude-code_glm-5.1
+trial_name: claude-code_glm-5.1_refine
 agent: claude-code
 model: glm-5.1
 timeout: 18000

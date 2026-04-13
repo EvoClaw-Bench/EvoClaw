@@ -559,9 +559,31 @@ class ClaudeCodeLogParser(AgentLogParser):
                 )
                 total_turns = jsonl_turns
 
-        # Fallback: if claude-code CLI didn't report cost (e.g. unrecognized model
-        # like glm-5.1), sum costUSD from modelUsage entries instead.
-        if total_cost == 0 and model_usage_dict:
+        # Recalculate cost for non-Claude models using our own pricing table.
+        # Claude Code CLI only knows Anthropic pricing and applies Sonnet rates
+        # to unknown models, producing inflated cost figures.
+        non_claude_models = [m for m in model_usage_dict if not m.startswith("claude")]
+        if non_claude_models:
+            recalc_cost = 0.0
+            for model, usage in model_usage_dict.items():
+                if not isinstance(usage, dict):
+                    continue
+                recalc_cost += self._calculate_message_cost(
+                    model=model,
+                    input_tokens=usage.get("inputTokens", 0),
+                    output_tokens=usage.get("outputTokens", 0),
+                    cache_read_tokens=usage.get("cacheReadInputTokens", 0),
+                    cache_creation_5m_tokens=usage.get("cacheCreationInputTokens", 0),
+                    cache_creation_1h_tokens=0,
+                )
+            logger.info(
+                f"Non-Claude model detected ({', '.join(non_claude_models)}); "
+                f"recalculated cost: ${recalc_cost:.2f} (CLI reported: ${total_cost:.2f})"
+            )
+            total_cost = recalc_cost
+        elif total_cost == 0 and model_usage_dict:
+            # Fallback: if claude-code CLI didn't report cost, sum costUSD
+            # from modelUsage entries instead.
             mu_cost = sum(u.get("costUSD", 0) for u in model_usage_dict.values() if isinstance(u, dict))
             if mu_cost > 0:
                 total_cost = mu_cost

@@ -488,12 +488,12 @@ try:
     upstream = os.environ.get("API_PROXY_UPSTREAM", "")
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
 
-    # Ensure upstream ends with /v1/chat/completions for OpenAI format
+    # Ensure upstream ends with /chat/completions for OpenAI format
     base = upstream.rstrip("/")
-    if not base.endswith("/v1/chat/completions"):
-        api_base_url = base + "/v1/chat/completions"
-    else:
+    if base.endswith("/chat/completions"):
         api_base_url = base
+    else:
+        api_base_url = base + "/v1/chat/completions"
 
     config = {{
         "PORT": {self._PROXY_PORT},
