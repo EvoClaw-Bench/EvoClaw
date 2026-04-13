@@ -559,6 +559,14 @@ class ClaudeCodeLogParser(AgentLogParser):
                 )
                 total_turns = jsonl_turns
 
+        # Fallback: if claude-code CLI didn't report cost (e.g. unrecognized model
+        # like glm-5.1), sum costUSD from modelUsage entries instead.
+        if total_cost == 0 and model_usage_dict:
+            mu_cost = sum(u.get("costUSD", 0) for u in model_usage_dict.values() if isinstance(u, dict))
+            if mu_cost > 0:
+                total_cost = mu_cost
+                logger.info(f"CLI reported $0 cost; using modelUsage sum: ${total_cost:.2f}")
+
         logger.info(
             f"Parsed stdout: {session_count} executions, {unique_session_count} unique sessions, "
             f"{total_turns} turns, ${total_cost:.2f}"
