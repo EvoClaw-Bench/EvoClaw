@@ -201,7 +201,7 @@ class E2EOrchestrator:
         modifiable_test_patterns: Optional[list[str]] = None,  # Test files agent can modify
         main_branch: str = "main",  # Main branch name from repo config
         drop_params: bool = False,  # Deprecated, use api_router
-        api_router: bool = False,  # Deploy claude-code-router-py for API translation
+        api_router: bool = False,  # Deploy vendored claude-code-router-py for API translation
         reasoning_effort: Optional[str] = None,  # For framework env var injection
     ):
         self.repo_name = repo_name

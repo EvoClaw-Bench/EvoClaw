@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from harness.e2e.agents.base import AgentFramework, register_framework
+from harness.e2e.model_aliases import resolve_model_alias
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,10 @@ class ClaudeCodeFramework(AgentFramework):
     Environment variables:
         UNIFIED_API_KEY: API key (mapped to ANTHROPIC_API_KEY in container)
         UNIFIED_BASE_URL: Base URL (mapped to ANTHROPIC_BASE_URL in container)
+        UNIFIED_DEFAULT_HAIKU_MODEL: Override for all of Claude Code's
+            class-based model slots (haiku / sonnet / opus / subagent /
+            global default). A single yaml field drives all five env vars
+            to the same value — see get_container_env_vars().
     """
 
     FRAMEWORK_NAME = "claude-code"
@@ -61,7 +66,12 @@ class ClaudeCodeFramework(AgentFramework):
         # (xhigh) rather than forcing "high". Forcing "high" also triggered
         # claude-code #48051 where the CLI-level setting runs as medium.
         self._reasoning_effort = reasoning_effort
-        self._default_haiku_model = os.environ.get("UNIFIED_DEFAULT_HAIKU_MODEL")
+        # Apply short-name aliasing (e.g. "kimi-k2.6" →
+        # "openrouter/moonshotai/kimi-k2.6") so every env var and --model flag
+        # downstream carries the canonical ID the all-hands LiteLLM proxy
+        # expects. Passthrough for unknown/native names.
+        raw_haiku = os.environ.get("UNIFIED_DEFAULT_HAIKU_MODEL")
+        self._default_haiku_model = resolve_model_alias(raw_haiku) if raw_haiku else None
 
     def get_effective_reasoning_effort(self) -> Optional[str]:
         """Return effective reasoning effort, or None if unset (model default)."""
@@ -92,6 +102,8 @@ class ClaudeCodeFramework(AgentFramework):
         Maps unified env vars to Claude-specific env vars:
         - UNIFIED_API_KEY -> ANTHROPIC_API_KEY
         - UNIFIED_BASE_URL -> ANTHROPIC_BASE_URL
+        - UNIFIED_DEFAULT_HAIKU_MODEL -> all five of Claude Code's
+          class-based model slots (see below)
 
         Returns:
             List of -e arguments for docker run
@@ -102,7 +114,32 @@ class ClaudeCodeFramework(AgentFramework):
         if self._base_url:
             env_vars.extend(["-e", f"ANTHROPIC_BASE_URL={self._base_url}"])
         if self._default_haiku_model:
-            env_vars.extend(["-e", f"ANTHROPIC_DEFAULT_HAIKU_MODEL={self._default_haiku_model}"])
+            # Route ALL of Claude Code's class-based model slots to the same
+            # model. Claude Code has five decision points where it picks a
+            # model by "class" rather than using --model:
+            #   HAIKU  — background tasks (auto-memory, skill listing,
+            #            context management)
+            #   SONNET — mid-tier fallback; some skills/subagents target
+            #            "sonnet class"
+            #   OPUS   — reasoning-heavy fallback
+            #   SUBAGENT — Agent/Task-tool spawns (claude-code specific)
+            #   ANTHROPIC_MODEL — global default when --model is not passed
+            #                     (affects nested claude invocations)
+            # Leaving any of these unset lets Claude Code fall back to
+            # api.anthropic.com with its hard-coded default (e.g.,
+            # claude-haiku-4-5), which (a) bypasses the configured
+            # UNIFIED_BASE_URL and (b) bills a separate Anthropic account.
+            # Pointing all five at default_haiku_model keeps every request
+            # on the same endpoint, which is especially critical for
+            # third-party proxies (Z.AI, all-hands, OpenRouter).
+            for env_name in (
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                "CLAUDE_CODE_SUBAGENT_MODEL",
+                "ANTHROPIC_MODEL",
+            ):
+                env_vars.extend(["-e", f"{env_name}={self._default_haiku_model}"])
         # Belt-and-suspenders: also set CLAUDE_CODE_EFFORT_LEVEL alongside the
         # `--effort` CLI flag. Workaround for github.com/anthropics/claude-code
         # issue #41028 where the CLI flag is parsed but not propagated to the
@@ -330,7 +367,7 @@ except Exception as e:
         cmd_parts = [
             "claude",
             "--model",
-            model,
+            resolve_model_alias(model),
             "--output-format",
             "json",
             "--dangerously-skip-permissions",
@@ -363,7 +400,7 @@ except Exception as e:
         cmd_parts = [
             "claude",
             "--model",
-            model,
+            resolve_model_alias(model),
             "--output-format",
             "json",
             "--dangerously-skip-permissions",

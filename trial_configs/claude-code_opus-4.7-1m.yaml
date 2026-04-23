@@ -1,0 +1,15 @@
+data_root: /data2/gangda/EvoClaw-data
+trial_name: claude-code_opus-4.7-1m
+agent: claude-code
+# 1M-context variant (claude-code strips [1m] before API call and sets the
+# context-1m-2025-08-07 beta header). Quoted because YAML treats unquoted
+# [...] as a flow sequence.
+model: "claude-opus-4-7[1m]"
+timeout: 18000
+# Route haiku slot (subagents / skills / auto-memory / context mgmt) to the
+# same 1M variant so background traffic doesn't silently drop to a different
+# model class.
+default_haiku_model: "claude-opus-4-7[1m]"
+# reasoning_effort intentionally unset — let opus-4-7 use its built-in
+# default (xhigh). Setting `max` triggers claude-code bug #48051 where it
+# runs as medium instead, collapsing thinking depth and trial score.

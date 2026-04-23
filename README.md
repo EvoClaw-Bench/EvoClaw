@@ -18,7 +18,9 @@
 ---
 
 > [!NOTE]
-> 🆕 **GPT-5.4** (xhigh) achieves **2nd place** among all models at **33.71%** score. See the [leaderboard](https://evo-claw.com).
+> 🆕 **Claude Opus 4.7** (xhigh, 200K & 1M context) achieves new SOTA at **39.83%** score. See the [leaderboard](https://evo-claw.com).
+>
+> 🆕 **GLM-5.1** is the best open-source model at **28.77%** score.
 
 Most existing benchmarks evaluate agents on **isolated, one-shot tasks**. But real-world workflows are not a bag of independent missions, they are continuous processes where tasks build on each other, dependencies interleave, and context accumulates over a long session.
 

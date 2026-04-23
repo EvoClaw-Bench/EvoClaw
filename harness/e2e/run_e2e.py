@@ -1889,8 +1889,8 @@ Example:
     parser.add_argument(
         "--reasoning-effort",
         default=None,
-        choices=["low", "medium", "high", "xhigh", "max"],
-        help="Reasoning effort (low|medium|high|xhigh|max). Default: unset → agent uses model's built-in default (e.g. opus-4-7=xhigh, sonnet/opus-4-6=high). For claude-code, also passed via CLAUDE_CODE_EFFORT_LEVEL env to work around upstream bug #41028.",
+        choices=["low", "medium", "high", "xhigh", "max", "none", "off"],
+        help="Reasoning effort (low|medium|high|xhigh|max). Use 'none' or 'off' to explicitly disable for upstreams that reject reasoning_effort (e.g. Moonshot kimi via OpenRouter returns HTTP 400 UnsupportedParamsError). Default: unset → agent uses model's built-in default (e.g. opus-4-7=xhigh, sonnet/opus-4-6=high; OpenHands auto-disables for kimi/moonshot). For claude-code, also passed via CLAUDE_CODE_EFFORT_LEVEL env to work around upstream bug #41028.",
     )
 
     # Config
@@ -1924,8 +1924,9 @@ Example:
     parser.add_argument(
         "--api-router",
         action="store_true",
-        help="Deploy claude-code-router-py inside the container to translate "
-        "Anthropic Messages API to OpenAI format. Only applies to claude-code agent.",
+        help="Deploy the vendored claude-code-router-py inside the container to "
+        "translate Anthropic Messages API to OpenAI format. Only applies to "
+        "claude-code agent.",
     )
 
     parser.add_argument(
@@ -2024,18 +2025,64 @@ Example:
             import shutil
             try:
                 shutil.rmtree(trial_root)
-            except (PermissionError, OSError):
-                # Docker-created files may be root-owned (PermissionError) or
-                # block rmdir of mount points like testbed/node_modules
-                # (OSError ENOTEMPTY); fall back to a container that runs as
-                # root to clear them.
-                import subprocess as _sp
-                _sp.run(
-                    ["docker", "run", "--rm", "-v", f"{trial_root}:/data", "alpine", "rm", "-rf", "/data"],
-                    capture_output=True, timeout=30,
+            except (PermissionError, OSError) as exc:
+                # Native rmtree can fail on:
+                #   - PermissionError: docker-copied files with root ownership
+                #   - OSError ENOTEMPTY: Python 3.12's _rmtree_safe_fd is
+                #     sensitive to deeply-nested trees (e.g., testbed/
+                #     ui/node_modules) and can race itself on some filesystems
+                # Fall back to an alpine container running as root, which is
+                # robust against both. We deliberately *never* abort --force
+                # here: even if the host-side dir can't be fully cleaned, the
+                # docker rm + new container later will reset the in-container
+                # state, which is what matters. Host-side residue is logged
+                # for manual cleanup but doesn't block the trial.
+                logger.warning(
+                    f"Native rmtree failed ({exc.__class__.__name__}: {exc}); "
+                    f"falling back to alpine container"
                 )
-                if trial_root.exists():
-                    shutil.rmtree(trial_root)
+                import subprocess as _sp
+                # Clear CONTENTS via find -mindepth 1 -delete: robust against
+                # empty dirs, hidden files, and weird filenames; doesn't touch
+                # the mount point itself (can't unlink an active bind target).
+                # 300s accommodates 400MB+ node_modules trees with many
+                # thousands of tiny files.
+                try:
+                    result = _sp.run(
+                        [
+                            "docker", "run", "--rm",
+                            "-v", f"{trial_root}:/data",
+                            "alpine", "find", "/data", "-mindepth", "1", "-delete",
+                        ],
+                        capture_output=True, timeout=300,
+                    )
+                    if result.returncode != 0:
+                        logger.warning(
+                            f"Alpine rm exited {result.returncode}; "
+                            f"stderr: {result.stderr.decode('utf-8', errors='replace')[:500]}"
+                        )
+                except _sp.TimeoutExpired:
+                    logger.warning(
+                        "Alpine rm timed out after 300s; residual files may remain"
+                    )
+                except Exception as alpine_exc:
+                    logger.warning(f"Alpine rm raised {alpine_exc.__class__.__name__}: {alpine_exc}")
+
+                # After alpine cleanup, the shell dir may still be there
+                # (mount point can't self-delete). Try to drop it; if residue
+                # remains, proceed with a loud warning rather than aborting.
+                if trial_root.exists() and any(trial_root.iterdir()):
+                    logger.warning(
+                        f"Trial dir {trial_root} has residual files after alpine "
+                        f"cleanup — proceeding with --force anyway (container "
+                        f"will be fresh). Consider `rm -rf {trial_root}` manually "
+                        f"after this trial."
+                    )
+                elif trial_root.exists():
+                    try:
+                        trial_root.rmdir()
+                    except OSError:
+                        pass  # benign; will be re-mkdir'd below
         else:
             logger.error(
                 f"Trial directory already exists and is not empty: {trial_root}\n"

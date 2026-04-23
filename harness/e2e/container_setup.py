@@ -28,6 +28,8 @@ WHITELISTED_DOMAINS = [
     "api.openai.com",
     "generativelanguage.googleapis.com",
     "open.bigmodel.cn",
+    "api.kimi.com",
+    "api.moonshot.ai",
     # === Go module proxy (replaces direct github.com) ===
     "proxy.golang.org",
     "sum.golang.org",
@@ -124,7 +126,7 @@ class ContainerSetup:
     # Port used by the in-container API router
     _PROXY_PORT = 8181
 
-    # Path to vendored claude-code-router-py relative to this file
+    # Vendored Python router copied wholesale into container at /opt/ccr.
     _ROUTER_VENDOR_DIR = Path(__file__).parent.parent.parent / "vendor" / "claude-code-router-py"
 
     def __init__(
@@ -149,11 +151,10 @@ class ContainerSetup:
             e2e_workspace_path: Path to mount as /e2e_workspace (for E2E mode)
             agent_framework_name: Agent framework to use (default: claude-code)
             drop_params: Deprecated, use api_router instead.
-            api_router: If True and agent is claude-code, deploy
-                claude-code-router-py inside the container to translate
-                Anthropic Messages API to OpenAI chat/completions format.
-                This enables Claude Code to work with any OpenAI-compatible
-                model backend without an external LiteLLM proxy.
+            api_router: If True and agent is claude-code, deploy the vendored
+                claude-code-router-py inside the container. Translates
+                Anthropic Messages API to OpenAI chat/completions format so
+                Claude Code can work with OpenAI-compatible backends.
         """
         self.container_name = container_name
         self.image_name = image_name
@@ -431,7 +432,7 @@ print("Base container initialization complete!")
 '''
 
     def _install_router_in_container(self) -> None:
-        """Copy claude-code-router-py into the container and install dependencies."""
+        """Copy vendored claude-code-router-py into the container + pip install."""
         vendor_dir = self._ROUTER_VENDOR_DIR
         if not vendor_dir.exists():
             raise RuntimeError(f"Router vendor directory not found: {vendor_dir}")
@@ -478,7 +479,7 @@ print("Base container initialization complete!")
         logger.info("API router (claude-code-router-py) installed in container")
 
     def _get_router_init_script(self) -> str:
-        """Return Python init script that starts claude-code-router-py daemon.
+        """Return init script that starts the vendored Python router daemon.
 
         The router translates Anthropic Messages API requests to OpenAI
         chat/completions format, enabling Claude Code to work with any

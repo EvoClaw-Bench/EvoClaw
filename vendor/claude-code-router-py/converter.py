@@ -77,6 +77,7 @@ def anthropic_to_openai(req: dict) -> dict:
         elif role == "assistant":
             text_parts: list[str] = []
             tool_calls: list[dict] = []
+            reasoning_parts: list[str] = []
 
             for block in content:
                 btype = block.get("type")
@@ -91,12 +92,25 @@ def anthropic_to_openai(req: dict) -> dict:
                             "arguments": json.dumps(block.get("input", {})),
                         },
                     })
-                # thinking blocks are internal — skip them
+                elif btype == "thinking":
+                    # Preserve reasoning across the round-trip. openai_to_anthropic
+                    # turned upstream `reasoning_content` into `thinking` blocks;
+                    # we must put them back on the outgoing assistant message so
+                    # the upstream sees a consistent conversation. Moonshot kimi
+                    # (and other reasoning models via LiteLLM/OpenRouter) reject
+                    # tool_call histories where some assistant turns carry
+                    # reasoning_content and others don't. Providers that don't
+                    # understand reasoning_content ignore it (OpenAI spec).
+                    t = block.get("thinking", "")
+                    if t:
+                        reasoning_parts.append(t)
 
             msg_obj: dict[str, Any] = {"role": "assistant"}
             msg_obj["content"] = "\n".join(text_parts) if text_parts else ""
             if tool_calls:
                 msg_obj["tool_calls"] = tool_calls
+            if reasoning_parts:
+                msg_obj["reasoning_content"] = "\n".join(reasoning_parts)
             messages.append(msg_obj)
 
     # Build base request

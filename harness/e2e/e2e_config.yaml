@@ -68,13 +68,27 @@ retry_and_timing:
 
   # Persisted no-progress resume policy (stored in trial_root/resume_retry_state.json).
   #
-  # When --resume-trial exits due to no progress repeatedly, this counter is persisted.
-  # On the next --resume-trial, if consecutive_no_progress_exits reaches
-  # resume_no_progress_retry_limit, apply resume_no_progress_policy:
-  # - exit: stop immediately (default)
-  # - start_new_session: clear persisted session and continue with a fresh session
-  resume_no_progress_retry_limit: 3
-  resume_no_progress_policy: exit
+  # Counter is incremented ONCE per worker invocation that stops with
+  # stopped_by_no_progress_limit=true. The *inner* max_no_progress_attempts
+  # (=3) already retries 3 times with the same session jsonl before stopping
+  # the worker, so each outer counter bump represents 3 failed inner
+  # attempts. Default 2 gives one "free" resume on the same session to
+  # tolerate a flaky stop (network blip, transient pause_turn) before
+  # rotating — total 6 inner attempts on the same jsonl before the policy
+  # kicks in. Raise toward 3+ only if you really want more same-session
+  # retries; lower to 1 if your model is context-fragile (kimi-k2.6 on a
+  # 3MB jsonl immediately hits pause_turn regardless of how many times you
+  # retry, so rotating on the first outer failure is strictly better).
+  # - start_new_session: clear persisted session_id on the next resume and
+  #   continue with a fresh agent session against the same trial dir +
+  #   container. git tags and /testbed work survive; only the claude
+  #   conversation history is reset. Best for operational runs where the
+  #   goal is completion and the old jsonl has grown past the model's
+  #   context window (kimi-k2.6 pause_turn / claude overflow).
+  # - exit: stop immediately. Safer for reproducibility studies — don't mask
+  #   model incapability with infinite session rotation.
+  resume_no_progress_retry_limit: 2
+  resume_no_progress_policy: start_new_session
 
   # Within a single worker invocation, when the initial `claude --resume <id>`
   # subprocess fails for a generic reason (non-zero exit, no fatal/auth/rate-

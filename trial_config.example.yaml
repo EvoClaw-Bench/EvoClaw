@@ -40,17 +40,19 @@ timeout: 18000
 #   - ripgrep
 #   - dubbo
 
-# Override the model Claude Code uses for background tasks (skill listing,
-# auto-memory, subagent spawning, context management). By default Claude
-# Code uses Haiku for these. When running through a proxy or third-party
-# endpoint, Haiku requests may route to a different (possibly expensive)
-# backend. Set this to your main model to keep all requests on the same
-# endpoint.
+# Override the model for ALL of Claude Code's class-based model slots.
+# Claude Code's hard-coded defaults (e.g., claude-haiku-4-5) go to
+# api.anthropic.com, bypassing your UNIFIED_BASE_URL and billing a
+# separate Anthropic account. Setting this field points all five
+# slots at the same model so every request stays on your proxy.
+# Despite the "haiku" name, this is the right answer for any
+# model call (HAIKU/SONNET/OPUS/SUBAGENT).
 # default_haiku_model: glm-5.1
 
-# Deploy claude-code-router-py inside the container to translate between
-# Anthropic Messages API and OpenAI chat/completions format. Only applies
-# to claude-code agent. Use when running Claude Code against non-Anthropic
-# models (e.g., GLM, GPT, Gemini) through an OpenAI-compatible endpoint.
-# You do NOT need this when using Claude Code with its native model.
+# Deploy the vendored claude-code-router-py inside the container to
+# translate between Anthropic Messages API and OpenAI chat/completions
+# format. Only applies to claude-code agent. Use when running Claude Code
+# against non-Anthropic models (e.g., GLM, GPT, Kimi) through an
+# OpenAI-compatible endpoint. You do NOT need this when using Claude Code
+# with its native model.
 # api_router: true

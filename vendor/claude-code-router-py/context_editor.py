@@ -82,6 +82,16 @@ def _clear_thinking(messages: list, edit: dict) -> dict:
     """Remove old thinking blocks from assistant messages.
 
     Keeps thinking from the N most recent assistant turns (default: 1).
+
+    IMPORTANT: Never clears thinking from assistant messages that also
+    contain tool_use blocks. Reasoning-model upstreams (Moonshot kimi,
+    and others reached via LiteLLM/OpenRouter) validate that if any
+    assistant tool_call message has reasoning_content, ALL tool_call
+    messages in the conversation must. Stripping thinking from an older
+    tool-call turn produces a mixed state and upstream returns HTTP 400
+    "thinking is enabled but reasoning_content is missing in assistant
+    tool call message at index N". We still clear thinking from pure
+    text-only assistant turns, where the validator is lenient.
     """
     keep = edit.get("keep", {"type": "thinking_turns", "value": 1})
     if keep == "all":
@@ -90,7 +100,8 @@ def _clear_thinking(messages: list, edit: dict) -> dict:
 
     keep_turns = keep.get("value", 1) if isinstance(keep, dict) else 1
 
-    # Find assistant turns that have thinking blocks
+    # Find assistant turns that have thinking blocks AND no tool_use —
+    # tool-call turns must keep their thinking for upstream consistency.
     turns_with_thinking: list[int] = []
     for i, msg in enumerate(messages):
         if msg.get("role") != "assistant":
@@ -98,7 +109,9 @@ def _clear_thinking(messages: list, edit: dict) -> dict:
         content = msg.get("content", [])
         if not isinstance(content, list):
             continue
-        if any(b.get("type") == "thinking" for b in content):
+        has_thinking = any(b.get("type") == "thinking" for b in content)
+        has_tool_use = any(b.get("type") == "tool_use" for b in content)
+        if has_thinking and not has_tool_use:
             turns_with_thinking.append(i)
 
     # Clear all but the last keep_turns

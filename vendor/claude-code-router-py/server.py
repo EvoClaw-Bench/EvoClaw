@@ -6,6 +6,7 @@ to an OpenAI-compatible provider, converting formats in both directions.
 import json
 import logging
 import os
+import re
 import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
@@ -100,6 +101,90 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Claude Code Router (Python)", lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Adaptive param stripping (for upstreams that reject reasoning-related
+# fields with HTTP 400 UnsupportedParamsError instead of silently dropping).
+#
+# Flow:
+#   1. First request for a (provider, model) pair goes out unmodified.
+#   2. If upstream returns 400 with "does not support parameters: [...]",
+#      we parse the list, intersect with _ADAPTIVE_STRIPPABLE_PARAMS
+#      (reasoning-only — we never silently drop temperature/top_p/etc.),
+#      cache the intersection, strip, and retry once.
+#   3. Subsequent requests for the same pair pre-strip from cache, so the
+#      400→retry round-trip happens only once per (provider, model).
+#
+# Known case: all-hands LiteLLM proxy → openrouter/moonshotai/kimi-k2.6
+# rejects `thinking` and `reasoning_effort`. Claude/GPT/Gemini/GLM families
+# accept them — this cache is per (provider, model), not per-prefix, so
+# mixed deployments (e.g., openrouter/anthropic/claude-opus-4-7 alongside
+# openrouter/moonshotai/kimi-k2.6) behave correctly without model-name
+# heuristics.
+# ---------------------------------------------------------------------------
+_UNSUPPORTED_PARAMS_CACHE: dict[tuple[str, str], set[str]] = {}
+_ADAPTIVE_STRIPPABLE_PARAMS: set[str] = {"thinking", "reasoning_effort"}
+_UNSUPPORTED_PARAMS_RE = re.compile(
+    r"does not support parameters:\s*\[([^\]]+)\]"
+)
+
+
+def _parse_unsupported_params(body: str | None) -> set[str]:
+    """Extract param names from LiteLLM's UnsupportedParamsError body.
+
+    Body may be raw text or JSON-wrapped; regex works on either form.
+    """
+    text = body or ""
+    # LiteLLM errors are typically {"error":{"message":"..."}}; unwrap if so.
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            err = parsed.get("error")
+            if isinstance(err, dict) and isinstance(err.get("message"), str):
+                text = err["message"]
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    m = _UNSUPPORTED_PARAMS_RE.search(text)
+    if not m:
+        return set()
+    return {p.strip().strip("'\"") for p in m.group(1).split(",") if p.strip()}
+
+
+def _apply_cached_strips(openai_req: dict, cache_key: tuple[str, str]) -> None:
+    """Pre-strip params known to be unsupported by this (provider, model)."""
+    for p in _UNSUPPORTED_PARAMS_CACHE.get(cache_key, ()):
+        openai_req.pop(p, None)
+
+
+def _try_adapt_after_400(
+    exc: ProviderError,
+    openai_req: dict,
+    cache_key: tuple[str, str],
+) -> set[str]:
+    """If exc is an UnsupportedParamsError for strippable reasoning fields,
+    update the cache, mutate openai_req to strip them, and return the set
+    that was stripped. Otherwise return empty set (caller should re-raise).
+    """
+    if exc.status != 400:
+        return set()
+    unsupported = _parse_unsupported_params(exc.body)
+    strippable = unsupported & _ADAPTIVE_STRIPPABLE_PARAMS
+    # Only act if the strippable params are actually in the request (else
+    # the retry would be identical and fail the same way).
+    strippable = {p for p in strippable if p in openai_req}
+    if not strippable:
+        return set()
+    _UNSUPPORTED_PARAMS_CACHE.setdefault(cache_key, set()).update(strippable)
+    for p in strippable:
+        openai_req.pop(p, None)
+    logger.warning(
+        "Upstream rejected %s for %s; stripped and will retry. "
+        "Future requests for this (provider, model) will skip these.",
+        sorted(strippable), cache_key,
+    )
+    return strippable
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +312,12 @@ async def messages(request: Request):
     # Anthropic → OpenAI, then apply provider param defaults
     openai_req = anthropic_to_openai(body)
     openai_req = apply_provider_params(provider, openai_req)
+
+    # Pre-strip any params already known to be unsupported by this
+    # (provider, model); populated on-demand via _try_adapt_after_400.
+    cache_key = (provider.get("name", ""), model)
+    _apply_cached_strips(openai_req, cache_key)
+
     log_openai_request(openai_req)
 
     headers = _provider_headers(provider)
@@ -240,7 +331,18 @@ async def messages(request: Request):
         try:
             stream = await open_provider_stream(url, headers, openai_req, timeout, max_retries)
         except ProviderError as exc:
-            raise HTTPException(exc.status or 502, exc.body or str(exc))
+            if _try_adapt_after_400(exc, openai_req, cache_key):
+                # Retry once with the newly-stripped request.
+                log_openai_request(openai_req)
+                try:
+                    stream = await open_provider_stream(url, headers, openai_req, timeout, max_retries)
+                except ProviderError as exc2:
+                    raise HTTPException(exc2.status or 502, exc2.body or str(exc2))
+                except Exception as exc2:
+                    logger.exception("Stream reconnection error")
+                    raise HTTPException(502, str(exc2))
+            else:
+                raise HTTPException(exc.status or 502, exc.body or str(exc))
         except Exception as exc:
             logger.exception("Stream connection error")
             raise HTTPException(502, str(exc))
@@ -260,8 +362,22 @@ async def messages(request: Request):
             url, headers, openai_req, timeout=timeout, max_retries=max_retries
         )
     except ProviderError as exc:
-        logger.error("Provider error: %s", exc)
-        raise HTTPException(exc.status or 502, exc.body or str(exc))
+        if _try_adapt_after_400(exc, openai_req, cache_key):
+            # Retry once with the newly-stripped request.
+            log_openai_request(openai_req)
+            try:
+                openai_resp = await post_json(
+                    url, headers, openai_req, timeout=timeout, max_retries=max_retries
+                )
+            except ProviderError as exc2:
+                logger.error("Provider error after adaptive retry: %s", exc2)
+                raise HTTPException(exc2.status or 502, exc2.body or str(exc2))
+            except Exception as exc2:
+                logger.exception("Unexpected error on adaptive retry")
+                raise HTTPException(502, str(exc2))
+        else:
+            logger.error("Provider error: %s", exc)
+            raise HTTPException(exc.status or 502, exc.body or str(exc))
     except Exception as exc:
         logger.exception("Unexpected error calling provider")
         raise HTTPException(502, str(exc))

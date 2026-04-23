@@ -53,8 +53,13 @@ Two forms for `trial_name`:
 
 > **Third-party endpoints:** When Claude Code talks to a non-Anthropic endpoint
 > (Z.AI, DeepSeek, all-hands proxy, …), set `default_haiku_model` to your main
-> model name. Claude Code's background tasks (skills, subagents) default to
-> Haiku, which would otherwise hit `api.anthropic.com` and fail / cost money.
+> model name. Claude Code has *five* class-based model slots (HAIKU / SONNET
+> / OPUS / SUBAGENT / global default) that each fall back to a hard-coded
+> Anthropic default (e.g., `claude-haiku-4-5`) when unset — those requests
+> hit `api.anthropic.com` directly, bypassing your `UNIFIED_BASE_URL` and
+> billing a separate Anthropic account. `default_haiku_model` (despite the
+> name) points all five slots at the same model, keeping every request on
+> your proxy.
 
 ---
 
@@ -191,10 +196,23 @@ docker exec "$CONT" sh -c 'ps -ef | grep "\--model" | grep -v grep'
 # 4. Orchestrator main thread is silent during long agent runs by design
 #    (it blocks on subprocess.run); look for auth / fatal errors here.
 tail -30 "$TRIAL_DIR/orchestrator.log"
+
+# 5. (Optional) Peek at what the agent is actually DOING — tail the session
+#    jsonl (same path as step 2). Recent records carry assistant thinking,
+#    tool_use calls, and tool_results. Reading the last ~15 entries tells
+#    you whether "no new submit for 30 min" is (a) productive slow work —
+#    agent is reasoning through real code, editing files, running tests,
+#    making non-trivial progress — or (b) a semantic loop — agent re-reads
+#    the same file, re-states the same plan, declares itself done without
+#    creating tags. (a) should be left alone; (b) is effectively stuck and
+#    will either self-terminate at 3/3 no-progress or warrants intervention.
 ```
 
 A jsonl mtime > 30 min while the agent process is alive with barely any CPU
-time is the smoking gun for a wedge.
+time is the smoking gun for a mechanical wedge. Step 5 catches the
+complementary case — mtime and CPU look fine but the agent is spinning on
+reasoning without submitting. Both are worth distinguishing before you
+decide to kill/resume vs wait.
 
 ### Recover (kill + resume)
 
@@ -300,31 +318,60 @@ are claude-code's; other agents have analogous session files — see
 is doing something, leave it alone. Otherwise judge the whole picture, not a
 checklist.
 
+When mtime is recent but the repo hasn't submitted for a long time, peek
+at the jsonl content (*Diagnose* step 5) to tell productive slow work from
+a semantic loop. Don't kill a repo whose agent is actively reading new
+files, editing, and running tests — that's just slow progress. Kill or let
+auto-stop a repo whose agent is re-reading the same spots and re-declaring
+itself done.
+
 ### Acting
 
 **Default: kill + resume autonomously.** Agent bugs, TCP wedges, session
-corruption — routine, the user can't help, asking just adds latency. The
-babysitter exists so the user can ignore the trial.
+corruption, naturally-stopped trials — routine, the user can't help,
+asking just adds latency. The babysitter exists so the user can ignore
+the trial. Two recovery patterns, picked by how the repo failed:
 
-A wedge is real enough to act on when the session file is 30+ min stale
-**and** the agent process is alive with CPU barely moving. **Prefer
-Approach B** (one-liner: `docker exec "$CONT" pkill -KILL -f 'claude --model'`).
-The harness retries up to 3 times before falling back to a fresh session, so
-a single transient stall is recovered automatically and you don't have to
-restart the worker. Use Approach A only if the host worker itself is sick.
-Report what you did in the next tick.
+**(a) Wedged** — session jsonl 30+ min stale **and** agent process alive
+with CPU barely moving.
+
+Use **Approach B**: `docker exec "$CONT" pkill -KILL -f 'claude --model'`.
+The harness retries up to 3 times before falling back to a fresh session,
+so a single transient stall recovers automatically and the worker stays up.
+Use Approach A (worker restart) only if the host worker itself is sick.
+
+**(b) Stopped** — monitor shows `■ stopped`; orchestrator.log tail reads
+`E2E Trial INCOMPLETE · Stopped after 3 consecutive attempts without
+progress`. The agent 3× in a row declared itself done (`terminal_reason:
+completed`) while the DAG still has unsubmitted milestones.
+
+Auto-resume it: `python scripts/run_all.py --config <yaml> --repos <substring>`.
+No `--force` — it's a clean resume (`run_all.py` detects the existing
+`trial_metadata.json` and uses `--resume-trial`). The no-progress counter
+resets on resume, so the agent gets a fresh 3-attempt budget. Repeat on
+every tick the repo is `■ stopped`.
+
+Report what you did in the next tick either way.
 
 **Escalate only when the user's input is actually needed**:
 
 - Auth / 401 in stderr → credentials may need refresh.
 - Container died or won't restart → may need `--force` (data loss).
 - Same repo wedges again shortly after a resume → pattern, not a one-off.
+- Same repo hits `■ stopped` 3+ times in the same session despite
+  resumes → model is genuinely incapable; needs a different model /
+  prompt decision, not more resumes.
 - Infrastructure problems (disk full, docker daemon).
 - Novel symptoms you can't reason through.
 
-**Don't**: `--force` for wedges (it wipes `/testbed` + git tags — reserve
-for trial-level config errors); restart healthy repos because a neighbor
-wedged; touch trials the user didn't ask about.
+**Don't**: `--force` for wedges or for stopped trials (it wipes
+`/testbed` + git tags — reserve for trial-level config errors); restart
+healthy repos because a neighbor wedged; touch trials the user didn't ask
+about.
+
+> The benchmark-protocol note below describes the *reproducibility-study*
+> rule (stop at 3-consec no-progress). Operational babysitting overrides
+> that — keep pushing a trial to completion unless the user says otherwise.
 
 ---
 

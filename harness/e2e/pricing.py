@@ -95,6 +95,7 @@ MODEL_PRICING: Dict[str, Dict[str, Any]] = {
     "glm-4.5-air": {"input": 0.2, "output": 1.1, "cache_read": 0.03, "cache_write": 0.2},
     # ── Moonshot Kimi ─────────────────────────────────────────────────────
     "kimi-k2.5": {"input": 0.6, "output": 3.0, "cache_read": 0.1},
+    "kimi-k2.6": {"input": 0.95, "output": 4.0, "cache_read": 0.16},
     # ── MiniMax ───────────────────────────────────────────────────────────
     "minimax-2.5": {"input": 0.3, "output": 2.4, "cache_read": 0.03, "cache_write": 0.375},
 }
@@ -159,6 +160,7 @@ _MATCH_ORDER = [
     ("glm-4.5-air", "glm-4.5-air"),  # must come before "glm-4"
     ("glm-4.7", "glm-4.7"),
     # Kimi
+    ("kimi-k2.6", "kimi-k2.6"),  # must come before "kimi-k2"
     ("kimi-k2", "kimi-k2.5"),    # "kimi-k2" or "kimi-k2.5-xxxxx"
     # MiniMax
     ("minimax", "minimax-2.5"),   # "minimax-xxxxx" → minimax-2.5

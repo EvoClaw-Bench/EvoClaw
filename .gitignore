@@ -252,5 +252,15 @@ litellm.log
 
 # EvoClaw trial config (user-specific) and auto-generated collect configs
 trial_config.yaml
-trial_configs/
+# Ignore ad-hoc trial_configs files by default; whitelist curated reference
+# configs below. NOTE: use `trial_configs/*` (not `trial_configs/`) so git
+# descends into the directory — a trailing-slash directory pattern would
+# suppress the `!` whitelist entries.
+trial_configs/*
+!trial_configs/claude-code_glm-5.1.yaml
+!trial_configs/claude-code_kimi-coding.yaml
+!trial_configs/claude-code_opus-4.6.yaml
+!trial_configs/claude-code_opus-4.7-1m.yaml
+!trial_configs/claude-code_opus-4.7.yaml
+!trial_configs/codex_gpt-5.4.yaml
 .evoclaw/

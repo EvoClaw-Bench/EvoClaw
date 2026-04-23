@@ -6,6 +6,7 @@ import subprocess
 from typing import Dict, List, Optional
 
 from harness.e2e.agents.base import AgentFramework, register_framework
+from harness.e2e.model_aliases import MODEL_ALIASES
 
 logger = logging.getLogger(__name__)
 
@@ -88,12 +89,35 @@ class OpenHandsFramework(AgentFramework):
         self._enable_delegation = enable_delegation
         self._enable_condenser = enable_condenser
         self._effective_model = model or self.DEFAULT_MODEL
-        # Default reasoning effort: xhigh for GPT, high for others
-        if reasoning_effort:
+        # Resolve reasoning effort.
+        # - Explicit "none"/"off"/"" → disable (don't send reasoning_effort to LLM)
+        # - Explicit other value → use as-is
+        # - Unset → model-aware default:
+        #     GPT / Codex    → "xhigh"
+        #     Moonshot / kimi → None. kimi-k2.6 ALWAYS runs with thinking
+        #                       enabled internally (it's not a toggle), and
+        #                       upstream LiteLLM/OpenRouter returns HTTP 400
+        #                       UnsupportedParamsError if we send
+        #                       reasoning_effort. So the correct setting is
+        #                       explicit None — disables the field at build
+        #                       time so OpenHands' SDK never attaches it to
+        #                       the /v1/chat/completions request. The
+        #                       trial_config `reasoning_effort: none` is
+        #                       belt-and-suspenders; this auto-default
+        #                       protects configs that forgot to set it.
+        #     anything else  → "high"
+        if reasoning_effort is not None and str(reasoning_effort).lower() in ("none", "off", ""):
+            self._reasoning_effort = None
+        elif reasoning_effort:
             self._reasoning_effort = reasoning_effort
         else:
             leaf_model = self._effective_model.split("/")[-1].lower()
-            self._reasoning_effort = "xhigh" if "gpt" in leaf_model else "high"
+            if "gpt" in leaf_model or "codex" in leaf_model:
+                self._reasoning_effort = "xhigh"
+            elif "kimi" in leaf_model or "moonshot" in leaf_model:
+                self._reasoning_effort = None
+            else:
+                self._reasoning_effort = "high"
 
     @property
     def use_sdk(self) -> bool:
@@ -1028,9 +1052,10 @@ if __name__ == "__main__":
         return script
 
     # -- Model alias mapping for LiteLLM proxy --------------------------------
-    _MODEL_ALIAS_MAP: Dict[str, str] = {
-        "kimi-k2.5": "openrouter/moonshotai/kimi-k2.5",
-    }
+    # Sourced from harness.e2e.model_aliases so the claude-code framework sees
+    # the same short-name → proxy-ID mapping. Re-bound as a class attr here so
+    # existing references in _normalize_model / tests keep working unchanged.
+    _MODEL_ALIAS_MAP: Dict[str, str] = MODEL_ALIASES
 
     # Models that need litellm's /openai_passthrough endpoint.
     # These bypass litellm's model routing and forward directly to OpenAI,
