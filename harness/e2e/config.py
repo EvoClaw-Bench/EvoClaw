@@ -113,17 +113,17 @@ DEFAULT_CONFIG = {
         "max_no_progress_attempts": 3,
         "recovery_wait_seconds": 60,
         "recover_message_timeout_seconds": 18000,
-        # After TWO worker-level no-progress exits, rotate the session on the
-        # next --resume-trial. The inner loop already retries
-        # max_no_progress_attempts (=3) times with the same session jsonl, so
-        # each outer failure represents 3 failed inner attempts. 2 outer =
-        # 6 total — enough slack for a single flaky exit (e.g. network blip
-        # or transient pause_turn) to self-recover on the next resume with
-        # the same session, but aggressive enough to rotate before the
-        # session jsonl bloats past the context window on hard-stuck trials
-        # (e.g. kimi-k2.6 on nushell). The old default (3) took 9 inner
-        # attempts which was too conservative for context-saturated runs.
-        "resume_no_progress_retry_limit": 2,
+        # After THREE worker-level no-progress exits (3 consecutive failed
+        # resumes), rotate the session on the next --resume-trial. The inner
+        # loop already retries max_no_progress_attempts (=3) times with the
+        # same session jsonl, so each outer failure represents 3 failed
+        # inner attempts. 3 outer = 9 total inner attempts — errs on the
+        # side of preserving session memory to maximize agent context
+        # continuity across transient stops. Once 9 attempts on the same
+        # jsonl haven't produced progress, rotating is the safer bet
+        # (covers bloated-context cases like kimi-k2.6 on nushell where
+        # the jsonl grew past the model's 200K window).
+        "resume_no_progress_retry_limit": 3,
         "resume_no_progress_policy": "start_new_session",
         "resume_subprocess_retry_limit": 3,
     },

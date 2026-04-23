@@ -143,19 +143,23 @@ Agent containers enforce an iptables-based outbound whitelist — only domains n
 
 > **Port 80 outbound blocked?** Some hosts/datacenters block plain HTTP. The harness automatically rewrites Debian/Ubuntu apt sources to HTTPS so `apt-get update` reaches mirrors via 443 — no action needed.
 
-**2. Agent exits prematurely before completing all milestones**
+**2. Agent stops before all milestones are completed**
 
-Due to LLM capability limitations or agent framework issues, agents may exit without completing all milestones. For example, out of memory, hitting API errors, or getting stuck in implementation loops without submitting. EvoClaw handles this with a built-in resume mechanism that recovers the agent session and continues from where it left off:
+Directly re-run the same `run_all.py` command to resume and continues from where the previous worker left off:
 
 ```bash
-python -m harness.e2e.run_e2e --resume-trial /path/to/trial_dir
+python scripts/run_all.py --config trial_config.yaml
 ```
 
-When possible, the agent resumes within the same session context, preserving its memory of all previous work. If the session becomes unrecoverable (e.g., corrupted state or context overflow after many turns), EvoClaw automatically falls back to a new session. In either case, all prior code changes and git state (commits, tags) are preserved inside the container, so the agent can continue from the current codebase state.
+> **Evaluation protocol**: The reported EvoClaw benchmark results follow this protocol: trials are resumed until all milestones are submitted and evaluated. Each resume reuses the same agent session by default to preserve the model's memory of prior work; after three consecutive resumes without new submissions, EvoClaw automatically rotates in a fresh session on the next resume so no repo blocks the trial indefinitely. We encourage reproducibility studies to follow the same setting.
 
-> **Resume requires the container to exist.** `/testbed` is not bind-mounted to the host, so `docker rm` destroys all uncommitted code, in-container git history, and the agent's session cache. If the container is gone, only `--force` (full restart from the initial commit) is possible — already-submitted milestones' source snapshots remain in `evaluation/`, but `/testbed` itself reverts to the initial state.
+> ⚠️ **Not every "no progress" is the agent's fault.** Rate-limit (HTTP 429), quota exhaustion, or auth (HTTP 401/403) errors also cause workers to exit with no submissions. Rotating the agent session won't help — the next request hits the same error. Check the session jsonl for `api_error_status: 429` / `"reached your usage limit"` / `401`; if present, fix the API key (top up or rotate) **before** resuming.
 
-> **Evaluation protocol**: The reported results in the EvoClaw benchmark follow a protocol where trials are resumed until all milestones are submitted and evaluated, unless three consecutive resumes yield no new submissions. We encourage reproducibility studies to follow the same setting.
+> **Resume requires the container to still exist.** All of the agent's in-progress work — code changes, git history, and Claude's conversation memory — lives inside the container, with no copy on the host. If the container is deleted, the whole trial's working state is lost and only `--force` (restart from scratch) is available. Source snapshots of already-evaluated milestones are preserved on the host under `evaluation/`, so prior scores survive, and the full agent logs are copied to the host directory when the trial finishes.
+
+**3. `api_router` is currently unstable for long trials**
+
+The `api_router` path (translating Anthropic ↔ OpenAI so Claude Code can talk to third-party models) is not recommended for full benchmark runs today — context tends to grow past the upstream's body limit on long sessions and some reasoning-model upstreams reject key Anthropic body fields.
 
 ## 🤝 Contributing
 

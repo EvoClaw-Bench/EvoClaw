@@ -72,22 +72,22 @@ retry_and_timing:
   # stopped_by_no_progress_limit=true. The *inner* max_no_progress_attempts
   # (=3) already retries 3 times with the same session jsonl before stopping
   # the worker, so each outer counter bump represents 3 failed inner
-  # attempts. Default 2 gives one "free" resume on the same session to
-  # tolerate a flaky stop (network blip, transient pause_turn) before
-  # rotating — total 6 inner attempts on the same jsonl before the policy
-  # kicks in. Raise toward 3+ only if you really want more same-session
-  # retries; lower to 1 if your model is context-fragile (kimi-k2.6 on a
-  # 3MB jsonl immediately hits pause_turn regardless of how many times you
-  # retry, so rotating on the first outer failure is strictly better).
+  # attempts. Default 3 → the policy only rotates after 9 total inner
+  # attempts on the same jsonl, maximizing agent context continuity across
+  # transient stops (network blips, flaky pause_turn, short rate-limit
+  # windows). Lower toward 1 only if your model is context-fragile and
+  # same-session retries are demonstrably futile (e.g. kimi-k2.6 with a
+  # 3MB jsonl that always pause_turn's on the first request, no matter
+  # how many times you retry).
   # - start_new_session: clear persisted session_id on the next resume and
   #   continue with a fresh agent session against the same trial dir +
   #   container. git tags and /testbed work survive; only the claude
   #   conversation history is reset. Best for operational runs where the
   #   goal is completion and the old jsonl has grown past the model's
-  #   context window (kimi-k2.6 pause_turn / claude overflow).
+  #   context window.
   # - exit: stop immediately. Safer for reproducibility studies — don't mask
   #   model incapability with infinite session rotation.
-  resume_no_progress_retry_limit: 2
+  resume_no_progress_retry_limit: 3
   resume_no_progress_policy: start_new_session
 
   # Within a single worker invocation, when the initial `claude --resume <id>`
