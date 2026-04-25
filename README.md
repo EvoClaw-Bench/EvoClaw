@@ -18,11 +18,13 @@
 ---
 
 > [!NOTE]
-> 🆕 **Claude Opus 4.7** (xhigh, 200K & 1M context) leads the overall leaderboard at **39.81%** score. See the [leaderboard](https://evo-claw.com).
+> 🆕 **Claude Opus 4.7** (xhigh, 200K & 1M context) leads the overall leaderboard at **39.81%**.
 >
-> 🆕 **GPT-5.5** (Codex) takes the #2 official spot at **37.77%** score.
+> 🆕 **GPT-5.5** takes the #2 official spot at **37.77%**.
 >
-> 🆕 **Kimi K2.6** achieves the best open-source model at **34.69%** score; **GLM-5.1** ranks #2 open-source at **28.77%** score.
+> 🆕 **Kimi K2.6** is the best open-source model at **34.69%**, but uses the most turns; **GLM-5.1** ranks #2 open-source at **28.77%** with about half the turns.
+>
+> See the [leaderboard](https://evo-claw.com).
 
 Most existing benchmarks evaluate agents on **isolated, one-shot tasks**. But real-world workflows are not a bag of independent missions, they are continuous processes where tasks build on each other, dependencies interleave, and context accumulates over a long session.
 
