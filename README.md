@@ -24,7 +24,7 @@
 >
 > 🆕 **Kimi K2.6** is the best open-source model at **34.69%**, but uses the most turns; **GLM-5.1** ranks #2 open-source at **28.77%** with about half the turns.
 >
-> See the [leaderboard](https://evo-claw.com).
+> See the [leaderboard](https://evo-claw.com) for more details!
 
 Most existing benchmarks evaluate agents on **isolated, one-shot tasks**. But real-world workflows are not a bag of independent missions, they are continuous processes where tasks build on each other, dependencies interleave, and context accumulates over a long session.
 
