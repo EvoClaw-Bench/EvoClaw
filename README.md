@@ -20,7 +20,7 @@
 > [!NOTE]
 > 🆕 **Claude Opus 4.7** (xhigh, 200K context) leads the overall leaderboard at **39.81%**.
 >
-> 🆕 **GPT-5.5** takes the #2 official spot at **37.77%**.
+> 🆕 **GPT-5.5** (xhigh, 272K context) takes the #2 official spot at **37.77%**.
 >
 > 🆕 **Kimi K2.6** is the best open-source model at **34.69%**, but uses the most turns; **GLM-5.1** ranks #2 open-source at **28.77%** with about half the turns.
 >
