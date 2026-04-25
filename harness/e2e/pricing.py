@@ -58,6 +58,8 @@ MODEL_PRICING: Dict[str, Dict[str, Any]] = {
             {"threshold": float("inf"), "input": 5.00, "cache_read": 0.50, "output": 22.50},
         ],
     },
+    # GPT-5.5 (released 2026-04-23): flat pricing across full context.
+    "gpt-5.5": {"input": 5.00, "cache_read": 0.50, "output": 30.00},
     "gpt-5.3-codex": {"input": 1.75, "cache_read": 0.175, "output": 14.00},
     "gpt-5.2-codex": {"input": 1.75, "cache_read": 0.175, "output": 14.00},
     "gpt-5.2": {"input": 1.75, "cache_read": 0.175, "output": 14.00},
@@ -136,6 +138,7 @@ _MATCH_ORDER = [
     ("haiku", "claude-haiku"),
     ("sonnet", "claude-sonnet"),
     # GPT (substring → key, only where pattern differs from key or for short aliases)
+    ("gpt-5.5", "gpt-5.5"),  # matches "gpt-5.5-2026-04-23", "gpt-5.5-codex" etc.
     ("gpt-5.3-codex", "gpt-5.3-codex"),  # match "gpt-5.3-codex-xxxxx"
     ("gpt-5.2-codex", "gpt-5.2-codex"),
     ("gpt-5.2-pro", "gpt-5.2-pro"),

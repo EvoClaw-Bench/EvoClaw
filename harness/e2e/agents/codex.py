@@ -72,15 +72,22 @@ class CodexFramework(AgentFramework):
         return self.reasoning_effort
 
     def _build_reasoning_effort_args(self) -> List[str]:
-        """Return Codex CLI overrides for reasoning effort.
+        """Return Codex CLI overrides for reasoning effort and safety knobs.
 
         Codex CLI reads model reasoning strength from `model_reasoning_effort`.
         Using `reasoning_effort` here does not reliably override config.toml in
         the containerized harness environment.
+
+        Also forces `web_search="disabled"`: the Responses-API web_search tool
+        runs server-side at the LLM provider and bypasses container iptables,
+        which lets agents fetch upstream code from github/etc and invalidates
+        benchmark results. Kept strictly off at CLI layer as a belt-and-braces
+        backup to the in-container config.toml.
         """
+        args: List[str] = ["-c", 'web_search="disabled"']
         if self.reasoning_effort and self.reasoning_effort in self.VALID_REASONING_EFFORTS:
-            return ["-c", f'model_reasoning_effort="{self.reasoning_effort}"']
-        return []
+            args.extend(["-c", f'model_reasoning_effort="{self.reasoning_effort}"'])
+        return args
 
     def _resolve_model(self, model: str) -> str:
         """Resolve model name."""
@@ -270,7 +277,12 @@ try:
     # MCP tokens, and other settings that interfere with the evaluation.
     config_dst = codex_dir / 'config.toml'
     base_url = os.environ.get('OPENAI_BASE_URL', '')
-    config_lines = []
+    # Always disable the Responses-API `web_search` tool: it runs server-side
+    # at the LLM provider and bypasses the container iptables whitelist,
+    # letting the agent fetch upstream code from github/etc even when the
+    # repo's own network path is blocked. Kept strictly off for benchmark
+    # integrity (valid values: disabled, cached, live).
+    config_lines = ['web_search = "disabled"']
     if base_url:
         config_lines.append(f'openai_base_url = "{base_url}"')
     with open(config_dst, 'w') as f:

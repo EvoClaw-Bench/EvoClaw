@@ -335,10 +335,13 @@ for trial_name in trial_names:
                 continue
 
             if event_type == "agent_exec_start":
-                # Auto-close any prior open segment for the same session
-                # (handles cases where exec_end was never written, e.g. process killed)
+                # Auto-close any prior open segment regardless of session_id.
+                # Only one agent runs per trial at a time, so a new start
+                # implies the previous one ended — covers both killed-process
+                # gaps and session rotation (old sid replaced by new sid
+                # without a matching exec_end).
                 for seg in reversed(segments):
-                    if seg["session_id"] == sid and seg["end"] is None:
+                    if seg["end"] is None:
                         seg["end"] = ts
                         seg["success"] = None  # unknown — implicitly ended
                         break
@@ -425,8 +428,17 @@ for ri, repo in enumerate(repo_list):
     repo_rows = grouped[repo]
     for i, (_, sid, start, end, dur, is_running, cidx) in enumerate(repo_rows):
         color = COLORS[cidx]
-        status = f"\033[32m● running{RESET}" if is_running else f"{DIM}✓ done{RESET}"
         is_last = (i == len(repo_rows) - 1)
+        if is_running:
+            status = f"\033[32m● running{RESET}"
+        elif is_last:
+            # Latest segment ended but worker may still be alive (rate-limit
+            # sleep, between-session recovery, or fully finished). Distinct
+            # from ✓ done which only applies to segments superseded by a
+            # later session start.
+            status = f"\033[33m↷ idle{RESET}"
+        else:
+            status = f"{DIM}✓ done{RESET}"
         if i == 0:
             label = f"{repo:<14}"
         else:

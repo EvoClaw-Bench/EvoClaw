@@ -485,14 +485,21 @@ class AgentLogParser(ABC):
         # Classify verification events from Bash tool calls (independent)
         verification_events = self._build_verification_events(tool_calls)
 
-        # Derive total_turns from milestone_stats when native usage units were
-        # used, since stdout_stats["total_turns"] may reflect a framework-
-        # specific counter (e.g. Claude Code's num_turns = user-initiated
-        # messages only, which is always 1 for mstone trials).
-        if native_usage_units and milestone_stats:
-            total_turns = sum(ms.turns for ms in milestone_stats.values())
-        else:
-            total_turns = stdout_stats.get("total_turns", 0)
+        # total_turns is summed from per-milestone counts, which are derived from
+        # native usage units (one UU = one LLM API call). The stdout-derived
+        # fallback was removed because it was unreliable: Claude Code's num_turns
+        # counts user-initiated messages (not LLM calls) and is always 1 in
+        # mstone trials. If there are milestones to attribute but no UUs, the
+        # parser is in an unrecoverable state — fail loud rather than report
+        # bogus numbers.
+        if milestone_stats and not native_usage_units:
+            raise RuntimeError(
+                f"Cannot derive total_turns: {len(milestone_stats)} milestones "
+                f"have stats but native_usage_units is empty. Most likely the "
+                f"agent jsonl logs are missing or the per-agent log_parser "
+                f"failed to extract per-message/turn usage."
+            )
+        total_turns = sum(ms.turns for ms in milestone_stats.values()) if milestone_stats else 0
 
         # Derive session counts from session_history.jsonl (authoritative)
         # when available, since stdout-based counts can miss sessions whose
@@ -861,9 +868,23 @@ class AgentLogParser(ABC):
         if not milestone_times:
             return {}
 
+        # Native usage units are the single source of truth for per-milestone
+        # turn/cost/token attribution. The legacy fallback (proportional split
+        # by tool-call count) was removed: Claude Code's stdout num_turns is
+        # user-message count (not LLM calls), and codex's stdout count is
+        # redundant with native UUs from the same rollout jsonl. If we got here
+        # with milestones but no UUs, the agent log extraction failed — fail
+        # loud rather than emit fabricated numbers.
+        if not native_usage_units:
+            raise RuntimeError(
+                f"_compute_milestone_stats: {len(milestone_times)} milestones "
+                f"to attribute but native_usage_units is empty. Per-agent "
+                f"log_parser must populate native usage units (one per LLM API "
+                f"call) — check that agent jsonl logs exist and are parseable."
+            )
+
         milestone_stats = {}
-        total_turns = stdout_stats.get("total_turns", 0)
-        native_usage_units = list(native_usage_units or [])
+        native_usage_units = list(native_usage_units)
         uu_proportional_shares = uu_proportional_shares or {}
 
         for mid, times in milestone_times.items():
@@ -891,49 +912,34 @@ class AgentLogParser(ABC):
             ms_sessions = self.detect_sessions_from_tool_calls(ms_tool_calls)
             ms_duration = sum(s.duration_ms for s in ms_sessions) if ms_sessions else ms_wall_clock
 
-            if native_usage_units:
-                # Aggregate cost/tokens from usage units, using proportional
-                # shares for units that span multiple milestones.
-                ms_cost = 0.0
-                ms_turns_f = 0.0
-                ms_token_usage: Dict[str, float] = defaultdict(float)
+            # Aggregate cost/tokens from usage units, using proportional shares
+            # for units that span multiple milestones.
+            ms_cost = 0.0
+            ms_turns_f = 0.0
+            ms_token_usage: Dict[str, float] = defaultdict(float)
 
-                for u in native_usage_units:
-                    shares = uu_proportional_shares.get(u.id)
-                    if shares is not None:
-                        # This UU spans multiple milestones — use proportional share
-                        share = shares.get(mid, 0.0)
-                        if share <= 0:
-                            continue
-                        ms_cost += float(u.cost_usd or 0.0) * share
-                        ms_turns_f += share
-                        for key, val in (u.token_usage or {}).items():
-                            if isinstance(val, (int, float)):
-                                ms_token_usage[key] += val * share
-                    elif u.milestone_id == mid:
-                        # Single-milestone UU — full attribution
-                        ms_cost += float(u.cost_usd or 0.0)
-                        ms_turns_f += 1.0
-                        for key, val in (u.token_usage or {}).items():
-                            if isinstance(val, (int, float)):
-                                ms_token_usage[key] += val
-
-                ms_turns = max(int(round(ms_turns_f)), 0)
-                ms_token_usage_int: Dict[str, int] = {k: int(round(v)) for k, v in ms_token_usage.items()}
-            else:
-                # Fallback path (legacy/non-native): estimated turns + tool-call
-                # usage distribution.
-                proportion = len(ms_tool_calls) / len(tool_calls) if tool_calls else 0
-                ms_turns = int(total_turns * proportion)
-                ms_cost = sum(float(tc.cost_usd or 0.0) for tc in ms_tool_calls)
-
-                ms_token_usage_int = defaultdict(int)
-                for tc in ms_tool_calls:
-                    if not tc.token_usage:
+            for u in native_usage_units:
+                shares = uu_proportional_shares.get(u.id)
+                if shares is not None:
+                    # This UU spans multiple milestones — use proportional share
+                    share = shares.get(mid, 0.0)
+                    if share <= 0:
                         continue
-                    for key, val in tc.token_usage.items():
+                    ms_cost += float(u.cost_usd or 0.0) * share
+                    ms_turns_f += share
+                    for key, val in (u.token_usage or {}).items():
                         if isinstance(val, (int, float)):
-                            ms_token_usage_int[key] += int(val)
+                            ms_token_usage[key] += val * share
+                elif u.milestone_id == mid:
+                    # Single-milestone UU — full attribution
+                    ms_cost += float(u.cost_usd or 0.0)
+                    ms_turns_f += 1.0
+                    for key, val in (u.token_usage or {}).items():
+                        if isinstance(val, (int, float)):
+                            ms_token_usage[key] += val
+
+            ms_turns = max(int(round(ms_turns_f)), 0)
+            ms_token_usage_int: Dict[str, int] = {k: int(round(v)) for k, v in ms_token_usage.items()}
 
             milestone_stats[mid] = MilestoneStats(
                 milestone_id=mid,
