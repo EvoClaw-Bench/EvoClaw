@@ -18,7 +18,7 @@
 ---
 
 > [!NOTE]
-> 🆕 **Claude Opus 4.7** (xhigh, 200K & 1M context) leads the overall leaderboard at **39.81%**.
+> 🆕 **Claude Opus 4.7** (xhigh, 200K context) leads the overall leaderboard at **39.81%**.
 >
 > 🆕 **GPT-5.5** takes the #2 official spot at **37.77%**.
 >
