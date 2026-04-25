@@ -259,8 +259,10 @@ trial_config.yaml
 trial_configs/*
 !trial_configs/claude-code_glm-5.1.yaml
 !trial_configs/claude-code_kimi-coding.yaml
+!trial_configs/claude-code_kimi-k2.6.yaml
 !trial_configs/claude-code_opus-4.6.yaml
 !trial_configs/claude-code_opus-4.7-1m.yaml
 !trial_configs/claude-code_opus-4.7.yaml
 !trial_configs/codex_gpt-5.4.yaml
+!trial_configs/codex_gpt-5.5.yaml
 .evoclaw/

@@ -1,0 +1,7 @@
+data_root: /data2/gangda/EvoClaw-data
+trial_name: codex_gpt-5.5
+agent: codex
+model: gpt-5.5
+timeout: 18000
+reasoning_effort: xhigh
+
